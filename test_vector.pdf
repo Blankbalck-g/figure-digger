@@ -1,0 +1,68 @@
+%PDF-1.4
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>
+endobj
+4 0 obj
+<< /Length 1609 >>
+stream
+0 0 0 RG 1 w
+100.0 500.0 m 400.0 500.0 l 400.0 700.0 l 100.0 700.0 l h S
+100.0 500.0 m 100.0 492.0 l S
+BT /F1 9 Tf 0 0 0 rg 1 0 0 1 97.50 480.0 Tm (0) Tj ET
+160.0 500.0 m 160.0 492.0 l S
+BT /F1 9 Tf 0 0 0 rg 1 0 0 1 157.50 480.0 Tm (1) Tj ET
+220.0 500.0 m 220.0 492.0 l S
+BT /F1 9 Tf 0 0 0 rg 1 0 0 1 217.50 480.0 Tm (2) Tj ET
+280.0 500.0 m 280.0 492.0 l S
+BT /F1 9 Tf 0 0 0 rg 1 0 0 1 277.50 480.0 Tm (3) Tj ET
+340.0 500.0 m 340.0 492.0 l S
+BT /F1 9 Tf 0 0 0 rg 1 0 0 1 337.50 480.0 Tm (4) Tj ET
+400.0 500.0 m 400.0 492.0 l S
+BT /F1 9 Tf 0 0 0 rg 1 0 0 1 397.50 480.0 Tm (5) Tj ET
+100.0 500.0 m 92.0 500.0 l S
+BT /F1 9 Tf 0 0 0 rg 1 0 0 1 83.00 497.00 Tm (0) Tj ET
+100.0 540.0 m 92.0 540.0 l S
+BT /F1 9 Tf 0 0 0 rg 1 0 0 1 83.00 537.00 Tm (2) Tj ET
+100.0 580.0 m 92.0 580.0 l S
+BT /F1 9 Tf 0 0 0 rg 1 0 0 1 83.00 577.00 Tm (4) Tj ET
+100.0 620.0 m 92.0 620.0 l S
+BT /F1 9 Tf 0 0 0 rg 1 0 0 1 83.00 617.00 Tm (6) Tj ET
+100.0 660.0 m 92.0 660.0 l S
+BT /F1 9 Tf 0 0 0 rg 1 0 0 1 83.00 657.00 Tm (8) Tj ET
+100.0 700.0 m 92.0 700.0 l S
+BT /F1 9 Tf 0 0 0 rg 1 0 0 1 78.00 697.00 Tm (10) Tj ET
+1 0 0 RG 1.5 w
+100.00 500.00 m 160.00 540.00 l 220.00 580.00 l 280.00 620.00 l 340.00 660.00 l 400.00 700.00 l S
+0 0 1 RG 1.5 w
+100.00 500.00 m 130.00 502.00 l 160.00 508.00 l 190.00 518.00 l 220.00 532.00 l 250.00 550.00 l 280.00 572.00 l 310.00 598.00 l 340.00 628.00 l 370.00 662.00 l 400.00 700.00 l S
+1 0 0 RG 1.5 w
+120.0 670.0 m 150.0 670.0 l S
+0 0 1 RG 1.5 w
+120.0 655.0 m 150.0 655.0 l S
+BT /F1 8 Tf 0 0 0 rg 1 0 0 1 156.00 667.00 Tm (series A) Tj ET
+BT /F1 8 Tf 0 0 0 rg 1 0 0 1 156.00 652.00 Tm (series B) Tj ET
+
+endstream
+endobj
+5 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>
+endobj
+xref
+0 6
+0000000000 65535 f 
+0000000009 00000 n 
+0000000058 00000 n 
+0000000115 00000 n 
+0000000241 00000 n 
+0000001902 00000 n 
+trailer
+<< /Size 6 /Root 1 0 R >>
+startxref
+1972
+%%EOF

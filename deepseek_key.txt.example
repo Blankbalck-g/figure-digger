@@ -1,0 +1,11 @@
+# DeepSeek API key 模板 —— 复制成 deepseek_key.txt 后把下面那行的 # 去掉，填上你自己的 key。
+#
+#   Windows :  copy deepseek_key.txt.example deepseek_key.txt
+#   macOS/Linux: cp deepseek_key.txt.example deepseek_key.txt
+#
+# 只保留一行，不要加引号、不要加空格：
+# sk-你的key写在这里
+#
+# 不想建文件也可以直接用环境变量：DEEPSEEK_API_KEY=sk-xxxx
+#
+# 本文件（.example）可以安心提交；deepseek_key.txt 已被 .gitignore 排除。

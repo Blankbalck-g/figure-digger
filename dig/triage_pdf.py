@@ -1,7 +1,7 @@
 """Triage a scientific PDF: locate figures, captions, and decide raster vs vector.
 
 Usage:
-    python triage_pdf.py <input.pdf> [--outdir fig-extract/output] [--dpi 300] [--no-export]
+    python dig/triage_pdf.py <input.pdf> [--outdir output] [--dpi 300] [--no-export]
 
 Outputs:
     <outdir>/<pdf-stem>_triage.json   machine readable report
@@ -227,7 +227,7 @@ def export_figures(pdf, report, outdir, dpi):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("pdf")
-    ap.add_argument("--outdir", default="fig-extract/output")
+    ap.add_argument("--outdir", default="output")
     ap.add_argument("--dpi", type=int, default=300)
     ap.add_argument("--no-export", action="store_true")
     args = ap.parse_args()

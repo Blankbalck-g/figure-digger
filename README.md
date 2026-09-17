@@ -4,7 +4,7 @@
 
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
 ![Status](https://img.shields.io/badge/status-beta-orange)
-![License](https://img.shields.io/badge/license-TBD-lightgrey)
+![License](https://img.shields.io/badge/license-MIT-green)
 ![VLM](https://img.shields.io/badge/VLM-optional%20(DeepSeek)-blueviolet)
 ![Vector](https://img.shields.io/badge/vector%20figures-lossless-success)
 
@@ -101,6 +101,33 @@ python run.py all  paper.pdf --out out --vlm --want "Figure 5, 图7"     # 说�
 
 ## 📁 输出结构
 
+仓库结构（`run.py` 是唯一入口，库模块都在 `dig/`）：
+
+```
+figure-digger/
+├── run.py              主入口：analyze / extract / confirm / batch / doctor
+├── dig/                核心库（每个模块也能单独跑，见各自 --help）
+│   ├── triage_pdf.py         分诊：找出图与图注、判断矢量/位图
+│   ├── split_panels.py       多子图切分
+│   ├── figure_index.py       图注↔图配对、--want 选图、正文通道
+│   ├── axis_ranges.py        OCR 刻度读数与标定
+│   ├── ocr_ticks.py          刻度识别的底层实现 + CLI
+│   ├── legend_colors.py      图例色块检测
+│   ├── extract_lines.py      曲线追踪核心
+│   ├── batch_extract.py      单篇内多面板的批量提取
+│   ├── vector_extract.py     矢量直读
+│   ├── verify_overlay.py     质检叠加图渲染
+│   ├── imgio.py              中文路径安全的读写
+│   ├── vlm_client.py         VLM 客户端（缓存 / 日志 / 用量）
+│   └── vlm_tasks.py          全部提示词常量
+├── tests/              回归测试与测试素材
+├── docs/               README 用的示例图
+├── requirements.txt
+└── LICENSE             MIT
+```
+
+`out/`（运行产物）：
+
 ```
 out/
 ├── figures/   从 PDF 抠出的图          panels/  切分后的子图
@@ -126,10 +153,10 @@ out/
 | `run.py extract <config.json> [--force] [--only ID...] [--vlm]` | 按 config 提取（只跑已确认的面板） |
 | `run.py confirm <config.json> --id ID [--x 0,8] [--y 0,3] [--skip]` | 确认 / 修正 / 跳过某个面板 |
 | `run.py doctor` | 环境自检（解释器、依赖、key） |
-| `vlm_client.py --check / --probe / --stats / --image-tokens / --probe-image` | key、实际模型、token 统计、单图 token |
+| `python dig/vlm_client.py --check / --probe / --stats / --image-tokens / --probe-image` | key、实际模型、token 统计、单图 token |
 
 常用参数：`--vlm` 启用 VLM；`--want "…"` 一句话指定要哪几张图；`--want-deep` 再用正文段落判定一次；`--vlm-model` / `--vlm-base-url` 覆盖默认模型与端点；`--pages` 只处理指定页；`--force` 跳过确认检查；`--jobs N` 并行批量（每篇一个进程，N 建议 ≤ CPU 核数）；`--no-ocr` 显式不再跑刻度 OCR；`--ocr` 即使在 `--vlm` 下也跑 OCR 做交叉核对。
-🔧 独立工具（`triage_pdf.py`、`split_panels.py`、`legend_colors.py`、`ocr_ticks.py`、`vector_extract.py`、`extract_lines.py`、`verify_overlay.py`）各自都可单跑，见 `--help`。
+🔧 `dig/` 里的每个模块都能单独跑（如 `python dig/triage_pdf.py paper.pdf`、`python dig/legend_colors.py fig.png`），见各自 `--help`。
 
 📦 批量产出：
 
@@ -224,7 +251,7 @@ python vlm_client.py --check                     # 验证 + 列出可用模型
 
 ## 🔧 定制与调参
 
-**提示词全部集中在 [`vlm_tasks.py`](vlm_tasks.py) 顶部的 8 个字符串常量**，直接改文本即可：
+**提示词全部集中在 [`dig/vlm_tasks.py`](dig/vlm_tasks.py) 顶部的字符串常量**，直接改文本即可：
 
 | 常量 | 行 | 作用 |
 |---|---|---|
@@ -247,19 +274,19 @@ python vlm_client.py --check                     # 验证 + 列出可用模型
 
 | 想改什么 | 位置 |
 |---|---|
-| 默认模型 / 端点 / 价格表 / 上传缩放上限 / 缓存与日志路径 | `vlm_client.py` L38/39、L288、L42/43、L40/41（模型端点也可用命令行覆盖） |
-| 抽查位置、抽查条数、容差 | `run.py` L878 `spots`、L883 `[:2]`；`vlm_tasks.py` L137 `axis_tolerance` |
+| 默认模型 / 端点 / 价格表 / 上传缩放上限 / 密钥与缓存路径 | `dig/vlm_client.py` L40/41、L290、L44/45、L42/43（模型端点也可用命令行覆盖） |
+| 抽查位置、抽查条数、容差 | `run.py` L878 `spots`、L883 `[:2]`；`dig/vlm_tasks.py` L137 `axis_tolerance` |
 | 非数据图判定（覆盖率/厚度）、子图边距 | `run.py` L668、L131 |
 | 矢量回退（裁剪边距、整页/无框/重复判定） | `run.py` L407、L410 |
 | 并行批量（每篇一个进程） | `run.py` L975 `_batch_one`、L1035 `_batch_parallel` |
-| 选图的图注配对距离、候选上限、缩略图尺寸 | `figure_index.py` L30/31 `SHEET_MAX`/`TILE_W`、`attach_captions` 里的 80/40/45 |
-| 正文通道的触发阈值与摘要长度上限 | `figure_index.py` L32 `BODY_TRIGGER`（低于该置信度才读正文）；`run.py` L223 `_body_digest` 的 `max_chars=12000` |
-| 轴读数质量门限、标签带尺寸 | `axis_ranges.py` L74 `min_r2=0.999`、L87/88 |
-| 图例色块检测 | `legend_colors.py` L43/56/130/171 |
-| 曲线颜色匹配与追踪 | `extract_lines.py` L164/L180 |
-| 坐标框检测 | `extract_lines.py` L62 |
-| 矢量区域检测 | `vector_extract.py` L39/137/238 |
-| PDF 图片过滤 / 渲染 DPI | `triage_pdf.py` L184 / L191 |
+| 选图的图注配对距离、候选上限、缩略图尺寸 | `dig/figure_index.py` L30/31 `SHEET_MAX`/`TILE_W`、`attach_captions` 里的 80/40/45 |
+| 正文通道的触发阈值与摘要长度上限 | `dig/figure_index.py` L32 `BODY_TRIGGER`；`run.py` L223 `_body_digest` 的 `max_chars=12000` |
+| 轴读数质量门限、标签带尺寸 | `dig/axis_ranges.py` L74 `min_r2=0.999`、L87/88 |
+| 图例色块检测 | `dig/legend_colors.py` L43/56/130/171 |
+| 曲线颜色匹配与追踪 | `dig/extract_lines.py` L164/L180 |
+| 坐标框检测 | `dig/extract_lines.py` L62 |
+| 矢量区域检测 | `dig/vector_extract.py` L39/137/238 |
+| PDF 图片过滤 / 渲染 DPI | `dig/triage_pdf.py` L184 / L191 |
 
 💡 **只改某一张图时不必动代码**——改它那份配置即可（`run.py confirm ...`），重跑时 VLM 结果走缓存几乎不花钱。
 调参顺序建议：先用 `--pages` 单页试，改一处看一处；优先调"证据阈值"（`min_r2`、容差），不要先动结论——把错误数据放进结果比漏掉更危险。
@@ -293,13 +320,13 @@ python vlm_client.py --check                     # 验证 + 列出可用模型
 
 ```bash
 # 矢量提取精度回归：生成已知答案的 PDF 并逐点核对（不需要 key）
-python make_test_vector_pdf.py test_vector.pdf
-python vector_extract.py test_vector.pdf --out test_vector_out
+python tests/make_test_vector_pdf.py tests/test_vector.pdf
+python dig/vector_extract.py tests/test_vector.pdf --out test_vector_out
 
 # VLM 链路自检（不需要 key、不联网）
-python vlm_client.py --selftest
-python test_vlm_mock.py [image.png]         # 本地 mock 服务器端到端
-python test_vlm_pipeline.py paper.pdf 7     # 用 mock 跑完整流水线
+python dig/vlm_client.py --selftest
+python tests/test_vlm_mock.py [image.png]           # 本地 mock 服务器端到端
+python tests/test_vlm_pipeline.py paper.pdf 7       # 用 mock 跑完整流水线
 ```
 
 📊 已知实测结果：矢量路线 **0 误差**；一篇 8 图 23 面板的论文 → 17 个数据面板 / 37 条曲线；VLM 抽查通过率 **98%**（唯一的失败项是双 Y 轴图，修正轴指派后 5/5 通过）。
@@ -307,14 +334,14 @@ python test_vlm_pipeline.py paper.pdf 7     # 用 mock 跑完整流水线
 | 模块 | 职责 |
 |---|---|
 | `run.py` | 主入口与流水线编排（analyze / extract / confirm / batch / doctor），含并行批量 |
-| `figure_index.py` | 图注↔图配对、按 `--want` 选图（本地编号匹配 + 缩略图对照图） |
-| `axis_ranges.py` / `ocr_ticks.py` | 刻度读数与标定（逻辑在 `axis_ranges.py`，`ocr_ticks.py` 只是 CLI 包装） |
-| `extract_lines.py` | 图像提取核心（轴框、图例排除、颜色匹配、逐列追踪） |
-| `legend_colors.py` | 图例色块检测（线段样本 + 圆点标记） |
-| `vector_extract.py` | 矢量直读 |
-| `vlm_client.py` / `vlm_tasks.py` | VLM 客户端（缓存/日志/重试）与四项任务提示词 |
-| `verify_overlay.py` | 质检图渲染（纯 OpenCV） |
-| `triage_pdf.py` / `split_panels.py` / `batch_extract.py` | 分诊（含按栏分行、图注跨行合并）、子图切分、批量提取 |
+| `dig/figure_index.py` | 图注↔图配对、按 `--want` 选图（本地编号匹配 + 缩略图对照图 + 正文通道） |
+| `dig/axis_ranges.py` / `dig/ocr_ticks.py` | 刻度读数与标定（实现都在 `axis_ranges.py`，`ocr_ticks.py` 是底层识别 + CLI） |
+| `dig/extract_lines.py` | 图像提取核心（轴框、图例排除、颜色匹配、逐列追踪） |
+| `dig/legend_colors.py` | 图例色块检测（线段样本 + 圆点标记） |
+| `dig/vector_extract.py` | 矢量直读（含图表内文字提取） |
+| `dig/vlm_client.py` / `dig/vlm_tasks.py` | VLM 客户端（缓存/日志/用量）与全部提示词 |
+| `dig/verify_overlay.py` / `dig/imgio.py` | 质检图渲染（纯 OpenCV）、中文路径安全读写 |
+| `dig/triage_pdf.py` / `dig/split_panels.py` / `dig/batch_extract.py` | 分诊（按栏分行、图注跨行合并）、子图切分、单篇多面板批量提取 |
 
 ## 🤝 贡献
 
@@ -326,4 +353,8 @@ python test_vlm_pipeline.py paper.pdf 7     # 用 mock 跑完整流水线
 
 ## ⚖️ 许可
 
+**MIT License** —— 见 [LICENSE](LICENSE)。可自由使用、修改、分发（包括商用），保留版权声明即可。
+
+> ⚠️ 注意：许可证只覆盖**本仓库的代码**。它不授予任何论文原文或从中提取出的数据的权利。
+>
 使用前请注意：提取他人论文中的数据涉及**版权与学术规范**，请遵守目标期刊与所在机构的规定，并在成果中正确引用数据来源。

@@ -12,7 +12,8 @@ import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "dig"))          # 库模块在 dig/
 import vlm_client as vc  # noqa: E402
 import vlm_tasks as vt  # noqa: E402
 
@@ -81,7 +82,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     image = Path(sys.argv[1]) if len(sys.argv) > 1 else (
-        Path(__file__).resolve().parent / "pipeline_out" / "figures" /
+        ROOT / "pipeline_out" / "figures" /
         "2023-01-1635_p7_img1.png")
     if not image.exists():
         print(f"找不到测试图 {image}")
@@ -140,7 +141,7 @@ def main():
     print(f"二次调用缓存命中={vlm.usage['cache_hits']}（>0 表示缓存生效）"
           f" 分类结果仍然可用: {again.get('chart_type')}")
     srv.shutdown()
-    print("\n✅ 链路自检通过 —— 你把真 key 写进 fig-extract/deepseek_key.txt 即可直接用")
+    print("\n✅ 链路自检通过 —— 你把真 key 写进项目根目录的 deepseek_key.txt 即可直接用")
     return 0
 
 

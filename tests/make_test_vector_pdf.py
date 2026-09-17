@@ -96,5 +96,6 @@ def build_pdf(path):
 
 
 if __name__ == "__main__":
-    target = sys.argv[1] if len(sys.argv) > 1 else "fig-extract/test_vector.pdf"
+    default = Path(__file__).resolve().parent / "test_vector.pdf"
+    target = sys.argv[1] if len(sys.argv) > 1 else str(default)
     build_pdf(target)

@@ -2,8 +2,8 @@
 
 Key handling - no key is hard-coded; it is read from the first place that has it:
   1. environment variable DEEPSEEK_API_KEY
-  2. fig-extract/deepseek_key.txt          (first non-empty line, plain text)
-  3. fig-extract/secrets.json              ({"deepseek_api_key": "..."})
+  2. <项目根目录>/deepseek_key.txt          (first non-empty line, plain text)
+  3. <项目根目录>/secrets.json              ({"deepseek_api_key": "..."})
 
 Every call is cached (sha256 of model+prompt+image) and appended to an audit log, so
 runs are reproducible and reviewable.
@@ -34,11 +34,13 @@ for stream in (sys.stdout, sys.stderr):
     except (AttributeError, ValueError):
         pass
 
-HERE = Path(__file__).resolve().parent
+# 项目根目录（run.py 所在的那一层）：密钥、缓存、审计日志都放在这里，
+# 而不是模块所在目录——模块在 dig/ 里面，路径不能跟着它走。
+ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_BASE_URL = "https://api.deepseek.com"
 DEFAULT_MODEL = "deepseek-flash"
-CACHE_DIR = HERE / ".vlm_cache"
-LOG_PATH = HERE / ".vlm_log.jsonl"
+CACHE_DIR = ROOT / ".vlm_cache"
+LOG_PATH = ROOT / ".vlm_log.jsonl"
 MAX_IMAGE_BYTES = 8 * 1024 * 1024
 MAX_SIDE = 2000
 
@@ -53,13 +55,13 @@ def load_api_key(explicit=None):
     env = os.environ.get("DEEPSEEK_API_KEY")
     if env and env.strip():
         return env.strip()
-    f = HERE / "deepseek_key.txt"
+    f = ROOT / "deepseek_key.txt"
     if f.exists():
         for line in f.read_text(encoding="utf-8").splitlines():
             line = line.strip()
             if line and not line.startswith("#"):
                 return line
-    f = HERE / "secrets.json"
+    f = ROOT / "secrets.json"
     if f.exists():
         try:
             data = json.loads(f.read_text(encoding="utf-8"))
@@ -117,7 +119,7 @@ class DeepSeekVLM:
     def _post(self, path, payload):
         if not self.api_key:
             raise VLMError(
-                "未配置 API key。请在 fig-extract/deepseek_key.txt 写入你的 key，"
+                "未配置 API key。请在项目根目录的 deepseek_key.txt 写入你的 key，"
                 "或设置环境变量 DEEPSEEK_API_KEY。")
         body = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(
@@ -465,7 +467,7 @@ def main():
                       cache=not args.no_cache, verbose=True, thinking=args.thinking)
     if args.check:
         if not vlm.api_key:
-            print("❌ 未找到 key。请把 key 写入 fig-extract/deepseek_key.txt（一行即可），"
+            print("❌ 未找到 key。请把 key 写入项目根目录的 deepseek_key.txt（一行即可），"
                   "或设置环境变量 DEEPSEEK_API_KEY。")
             return
         print(f"✅ 已找到 key（长度 {len(vlm.api_key)}），base_url={vlm.base_url}")

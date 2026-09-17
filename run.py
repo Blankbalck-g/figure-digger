@@ -27,6 +27,11 @@ import sys
 import time
 from pathlib import Path
 
+# 库模块都在 dig/ 里，先把它加进搜索路径。要在下面的 import 之前做，
+# 否则 imgio/numpy 的"环境不对"误报会先跳出来（模块之间仍是扁平 import）。
+ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(ROOT / "dig"))
+
 # Windows consoles default to GBK; make output UTF-8 before anything prints, including
 # the dependency-check message below.
 for _stream in (sys.stdout, sys.stderr):
@@ -54,8 +59,6 @@ except ImportError as _exc:  # almost always "wrong Python environment"
     print("    python run.py doctor            # 一键自检")
     print(_bar)
     raise SystemExit(2)
-
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import axis_ranges as ar  # noqa: E402
 import batch_extract as be  # noqa: E402
@@ -1295,7 +1298,7 @@ def main():
                                   verbose=True)
         if not client.api_key:
             log("⚠ 指定了 --vlm 但没找到 API key："
-                "请把 key 写入 fig-extract/deepseek_key.txt 或设置 DEEPSEEK_API_KEY。"
+                "请把 key 写入项目根目录的 deepseek_key.txt 或设置 DEEPSEEK_API_KEY。"
                 "本次将只走 OCR / 图像处理路线。")
             return None
         log(f"VLM 已启用：model={client.model}  base_url={client.base_url}")

@@ -10,7 +10,10 @@ import threading
 from http.server import HTTPServer
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))                  # run.py 在根目录
+sys.path.insert(0, str(ROOT / "dig"))          # 库模块在 dig/
+sys.path.insert(0, str(Path(__file__).resolve().parent))   # test_vlm_mock 在同目录
 
 import run as wpd_run  # noqa: E402
 import vlm_client as vc  # noqa: E402
@@ -25,7 +28,7 @@ for stream in (sys.stdout, sys.stderr):
 
 def main():
     here = Path(__file__).resolve().parent
-    pdf = Path(sys.argv[1]) if len(sys.argv) > 1 else (here.parent / "2023-01-1635.pdf")
+    pdf = Path(sys.argv[1]) if len(sys.argv) > 1 else (here.parent / "papers" / "2023-01-1635.pdf")
     page = sys.argv[2] if len(sys.argv) > 2 else "7"
     out = here / "vlm_test_out"
 

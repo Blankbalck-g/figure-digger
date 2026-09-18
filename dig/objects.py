@@ -150,6 +150,37 @@ def _varies_along_curve(members):
     return (max(ys) - min(ys)) >= 3.0 * max(1.0, float(np.median(heights)))
 
 
+def _drop_fragments(objects, tol=8.0, need=0.75):
+    """A shorter trace lying on top of a longer one of the same colour is its fragment.
+
+    Sending every fragment to the model blurred the picture: a clean two-curve panel
+    produced nine numbered objects, and the model (correctly, given what it saw) called
+    the long one "a frame line". Fragments stay in the report but are not offered.
+    """
+    lines = [o for o in objects if o["kind"] == "line" and o.get("trace")]
+    lines.sort(key=lambda o: -len(o["trace"]))
+    keep, dropped = [], 0
+    for o in lines:
+        by = {}
+        for k in keep:
+            for x, y in k["trace"]:
+                by.setdefault(x, []).append(y)
+        inside = total = 0
+        for x, y in o["trace"]:
+            ys = by.get(x)
+            if not ys:
+                continue
+            total += 1
+            if min(abs(y - yy) for yy in ys) <= tol:
+                inside += 1
+        if total >= 15 and inside / total >= need:
+            o["fragment_of"] = True
+            dropped += 1
+            continue
+        keep.append(o)
+    return [o for o in objects if not o.get("fragment_of")]
+
+
 def _heal_small(comps, max_gap=6.0, max_major=80):
     """Merge a marker that an error bar cut into left/right halves.
 
@@ -342,6 +373,7 @@ def detect_objects(img, frame, exclude_boxes=(), max_objects=MAX_OBJECTS):
     texts.sort(key=lambda o: -o["nx"])
     objects += texts[:4]                 # 标注只留最大的几块，够模型判断即可
 
+    objects = _drop_fragments(objects)
     # 线和标记优先占名额，剩下的名额才给标注文字
     objects.sort(key=lambda o: (o["kind"] == "text", -(o.get("nx") or 0),
                                 -(o.get("n_markers") or 0)))
@@ -386,7 +418,9 @@ def render_sheet(img, objects, frame, out_path, tile=260, cols=4):
             for cx, cy in o["centroids"]:
                 cv2.circle(vis, (int(cx), int(cy)), 3, (0, 0, 255), -1)
         elif o["kind"] == "line" and o.get("trace"):
-            for x, y in o["trace"][::2]:
+            # 画稀疏的点而不是连续折线：连续线会把"虚线"画成"实线"，
+            # 模型看到实线就会说"图例里是虚线，这根对不上"→ 判成边框（实测踩到）
+            for x, y in o["trace"][::6]:
                 cv2.circle(vis, (int(x), int(y)), 1, (0, 0, 255), -1)
         cv2.rectangle(vis, (x0, y0), (x1, y1), color, 2)
         cv2.rectangle(vis, (x0, max(0, y0 - 22)), (x0 + 34, y0), (255, 255, 255), -1)

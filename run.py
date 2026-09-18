@@ -225,16 +225,66 @@ def _vector_inner_text(page, axes):
 
 
 def _dark_line_wanted(panel):
-    """提取黑线只在模型确认"图里确实有一条深色数据线"时才做。
+    """黑线提取默认关闭，只有面板里显式写了 allow_dark=true 才做。
 
-    黑线默认不碰是有原因的：坐标轴、虚线网格、每个文字标注都是黑的。模型判断
-    它是数据/模型曲线时才启用，其余情况跳过，免得把文字当数据。
+    实测代价：黑线通道在这些论文里会把 "EOI"、"11 MPa"、"S ∝ t^0.5" 这些黑字串成
+    一条曲线输出（2014-01-9079 / 2014-01-1413 几乎每个面板都多出 dark/dark_2 两条
+    假曲线），比"黑线提不出来"更糟。所以改成显式开启：分析阶段若发现深色数据线会在
+    日志里提示，用户要把该面板的 allow_dark 改成 true 才会提取。
     """
+    if not panel.get("allow_dark"):
+        return False
     info = panel.get("vlm_dark_line") or {}
     if not info.get("has_dark_line"):
         return False
     kind = str(info.get("kind") or "").strip().lower()
     return kind in ("", "data", "model", "data_line", "model_line", "experiment")
+
+
+def _extract_panel(panel, panel_path, rng, csv_dir):
+    """Pick one series,两种方式：模型逐物件判定（优先）或按颜色追踪（回退）。
+
+    物件路线是"模型负责懂、代码负责准"的落地点：模型说哪个物件是数据、要出点还是出线，
+    代码就用那个物件自己的像素去算（标记取中心、线取轨迹）。没有判定结果时（没开
+    --vlm、判定失败、或用户用 --no-object-judge 关掉了）自动回退到颜色追踪。
+    """
+    decisions = (panel.get("objects") or {}).get("decisions") or []
+    if decisions:
+        try:
+            panel_img = iio.imread(panel_path)
+            if panel_img is not None:
+                gray_p = cv2.cvtColor(panel_img, cv2.COLOR_BGR2GRAY)
+                frame_p = be._frame_of(gray_p, panel.get("frame"))
+                objs = ob.detect_objects(panel_img, frame_p, be.inner_boxes(gray_p, frame_p))
+                series, skipped = be.process_objects(panel_path, frame_p, objs, decisions,
+                                                     rng, csv_dir)
+                if series or skipped:
+                    return {"panel": panel_path.name, "frame": list(frame_p),
+                            "series": series, "skipped_series": skipped, "method": "objects"}
+        except Exception as exc:  # noqa: BLE001
+            log(f"      （物件路线失败，回退颜色追踪：{type(exc).__name__}: {exc}）")
+    try:
+        return be.process_panel(
+            panel_path, rng, csv_dir, sat_min=70, val_min=40, hue_tol=16,
+            legend_colors=panel["legend_colors"] or None,
+            name_map=panel.get("series_names") or None,
+            series_y=series_y_from(panel),
+            roles=panel.get("series_roles") or None,
+            allow_dark=_dark_line_wanted(panel),
+            frame_hint=panel.get("frame"))
+    except Exception as exc:  # noqa: BLE001
+        log(f"{panel['id']}: ✗ 提取失败 {type(exc).__name__}: {exc}")
+        return None
+
+
+def series_y_from(panel):
+    """{颜色: 纵轴范围} —— 双 Y 轴图里每条曲线读自己那条轴。"""
+    out = {}
+    for col, side in (panel.get("series_axes") or {}).items():
+        detail = (panel.get("y_axes") or {}).get(side) or {}
+        if detail.get("range"):
+            out[col.upper()] = detail["range"]
+    return out or None
 
 
 def _body_digest(pdf_path, want_pages=None, max_chars=12000):
@@ -643,7 +693,8 @@ def analyze(pdf_path, outdir, dpi=300, vlm=None, pages=None, use_ocr=None, want=
                 dark_info = nm.get("dark_series") or {}
                 if dark_info.get("has_dark_line"):
                     log(f"      图中有深色线：{str(dark_info.get('kind') or '?')}"
-                        f"（{str(dark_info.get('desc') or '')[:50]}）")
+                        f"（{str(dark_info.get('desc') or '')[:50]}）"
+                        " → 默认不提取；要提就在 config 里把该面板的 allow_dark 设为 true")
             except vlmc.VLMError as exc:
                 log(f"      VLM 命名失败: {exc}")
 
@@ -869,7 +920,9 @@ def write_report(config, path, phase, results=None):
                     + (f", 已修复={o['repaired']}" if o["repaired"] else ""))
         objs = p.get("objects")
         if objs and objs.get("decisions"):
-            lines.append(f"- 物件判定（对照图 `{objs.get('sheet')}`，逐个编号判断「哪根是哪根」）:")
+            lines.append(f"- 物件判定（对照图 `{objs.get('sheet')}`，逐个编号判断「哪根是哪根」）"
+                         "。判断有误可以直接改 config：把该物件的 `output` 改成 "
+                         "`line`/`points`，或把 `is_data` 改成 true，再跑一次 extract:")
             for d in objs["decisions"]:
                 mark = "✅ 提取" if (d.get("is_data") and str(d.get("output")).lower() != "skip") \
                     else "⏭️ 跳过"
@@ -909,6 +962,22 @@ def extract(cfg_path, force=False, only=None, vlm=None):
     verify_dir = outdir / "verify"
     csv_dir.mkdir(parents=True, exist_ok=True)
     verify_dir.mkdir(parents=True, exist_ok=True)
+
+    # 重跑时先清掉这次要覆盖的旧产物：否则新旧结果混在一个目录里，
+    # 分不清哪个 CSV 是这一次的（实测把这批论文重跑时踩到过）
+    if not only:
+        for d in (csv_dir, verify_dir):
+            for f in d.glob("*"):
+                if f.is_file():
+                    f.unlink()
+    else:
+        for p in config["panels"]:
+            if p["id"] not in only:
+                continue
+            stem = Path(p.get("panel_image") or "").stem
+            for d in (csv_dir, verify_dir):
+                for f in list(d.glob(f"{stem}*")) if stem else []:
+                    f.unlink()
 
     results = {}
     pdf_doc = None
@@ -975,32 +1044,27 @@ def extract(cfg_path, force=False, only=None, vlm=None):
         panel_path = Path(p["panel_image"])
         if not panel_path.is_absolute():
             panel_path = outdir / panel_path
-        try:
-            res = be.process_panel(panel_path, rng, csv_dir,
-                                   sat_min=70, val_min=40, hue_tol=16,
-                                   legend_colors=p["legend_colors"] or None,
-                                   name_map=p.get("series_names") or None,
-                                   series_y=series_y or None,
-                                   roles=p.get("series_roles") or None,
-                                   allow_dark=_dark_line_wanted(p),
-                                   # 图里已经知道的坐标框（PDF 里量的 / 子图切分检出的），
-                                   # 只在自动找框失败时才用得上
-                                   frame_hint=p.get("frame"))
-        except Exception as exc:  # noqa: BLE001
-            # 单个面板失败（典型：图里没有闭合坐标框）不该连累这篇的其余面板
-            log(f"{p['id']}: ✗ 提取失败 {type(exc).__name__}: {exc}")
-            results[p["id"]] = {"series": [], "error": f"{type(exc).__name__}: {exc}",
-                                "axis_range": rng}
+        res = _extract_panel(p, panel_path, rng, csv_dir)
+        if res is None:
+            results[p["id"]] = {"series": [], "error": "提取失败", "axis_range": rng}
             continue
         res["axis_range"] = rng
         results[p["id"]] = res
         log(f"{p['id']}: {len(res.get('series', []))} 条曲线"
-            + (f"  frame={res.get('frame')}" if res.get("series") else ""))
+            + (f"  方式={'物件判定' if res.get('method') == 'objects' else '颜色追踪'}"
+               if res.get("series") else ""))
+        for sk in res.get("skipped_series") or []:
+            log(f"      ⏭ 跳过物件#{sk.get('object', '?')}（{str(sk.get('what'))[:36]}）："
+                f"{str(sk.get('reason'))[:60]}")
         if res.get("series"):
             files = [csv_dir / s["file"] for s in res["series"]]
-            colors = [s.get("target_bgr") and "#{:02x}{:02x}{:02x}".format(
-                s["target_bgr"][2], s["target_bgr"][1], s["target_bgr"][0]) or "#ff00ff"
-                for s in res["series"]]
+            colors = []
+            for s in res["series"]:
+                hexs = s.get("color_hex")
+                if not hexs and s.get("target_bgr"):
+                    hexs = "#{:02x}{:02x}{:02x}".format(
+                        s["target_bgr"][2], s["target_bgr"][1], s["target_bgr"][0])
+                colors.append(hexs or "#ff00ff")
             make_verify_image(panel_path, res["frame"], ax, colors, files,
                               verify_dir / f"{p['id']}_verify.png")
 

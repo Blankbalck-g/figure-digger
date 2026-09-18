@@ -169,36 +169,6 @@ def process_panel(image_path, rng, outdir, sat_min, val_min, hue_tol,
                     "x_range": [round(min(p[0] for p in data), 4), round(max(p[0] for p in data), 4)],
                     "y_range": [round(min(p[1] for p in data), 4), round(max(p[1] for p in data), 4)],
                 })
-        if allow_dark:                      # 黑色数据线：模型确认存在时才做
-            for k, pts in enumerate(el.trace_dark_instances(gray, frame, legends,
-                                                            max_instances=2), start=1):
-                data = el.to_data(pts, frame, xmin, xmax, ymin, ymax)
-                q = _quality(data, (xmin, xmax), (ymin, ymax))
-                if not q["ok"]:
-                    skipped.append({"color": "dark", "points": len(data),
-                                    "reason": "黑线：" + "；".join(q["reasons"])})
-                    continue
-                if q["y_span"] < DARK_MIN_Y_SPAN:
-                    # 贴着坐标轴的水平暗条多半是轴线/文字行，不是数据曲线
-                    skipped.append({"color": "dark", "points": len(data),
-                                    "reason": f"黑线：几乎水平（y 只跨 {q['y_span'] * 100:.0f}% 量程），"
-                                              f"疑似轴线或文字行"})
-                    continue
-                if any(_same_line(pts, prev) for prev in kept_traces):
-                    continue
-                kept_traces.append(pts)
-                name = f"{image_path.stem}_dark{'' if k == 1 else f'_{k}'}.csv"
-                with (outdir / name).open("w", newline="", encoding="utf-8") as fh:
-                    wr = csv.writer(fh)
-                    wr.writerow(["x", "y"])
-                    for xv, yv in data:
-                        wr.writerow([f"{xv:.6g}", f"{yv:.6g}"])
-                series.append({
-                    "file": name, "source": "dark", "color": "dark", "label": "dark",
-                    "instance": k, "points": len(data), "quality": q,
-                    "x_range": [round(min(p[0] for p in data), 4), round(max(p[0] for p in data), 4)],
-                    "y_range": [round(min(p[1] for p in data), 4), round(max(p[1] for p in data), 4)],
-                })
     else:
         peaks = el.detect_series_colors(hsv, frame, legends, sat_min, val_min)
         for hue_c, count in peaks:
@@ -236,6 +206,36 @@ def process_panel(image_path, rng, outdir, sat_min, val_min, hue_tol,
                     "x_range": [round(min(p[0] for p in data), 4), round(max(p[0] for p in data), 4)],
                     "y_range": [round(min(p[1] for p in data), 4), round(max(p[1] for p in data), 4)],
                 })
+    if allow_dark:                      # 黑色数据线：模型确认存在时才做
+        for k, pts in enumerate(el.trace_dark_instances(gray, frame, legends,
+                                                        max_instances=2), start=1):
+            data = el.to_data(pts, frame, xmin, xmax, ymin, ymax)
+            q = _quality(data, (xmin, xmax), (ymin, ymax))
+            if not q["ok"]:
+                skipped.append({"color": "dark", "points": len(data),
+                                "reason": "黑线：" + "；".join(q["reasons"])})
+                continue
+            if q["y_span"] < DARK_MIN_Y_SPAN:
+                # 贴着坐标轴的水平暗条多半是轴线/文字行，不是数据曲线
+                skipped.append({"color": "dark", "points": len(data),
+                                "reason": f"黑线：几乎水平（y 只跨 {q['y_span'] * 100:.0f}% 量程），"
+                                          f"疑似轴线或文字行"})
+                continue
+            if any(_same_line(pts, prev) for prev in kept_traces):
+                continue
+            kept_traces.append(pts)
+            name = f"{image_path.stem}_dark{'' if k == 1 else f'_{k}'}.csv"
+            with (outdir / name).open("w", newline="", encoding="utf-8") as fh:
+                wr = csv.writer(fh)
+                wr.writerow(["x", "y"])
+                for xv, yv in data:
+                    wr.writerow([f"{xv:.6g}", f"{yv:.6g}"])
+            series.append({
+                "file": name, "source": "dark", "color": "dark", "label": "dark",
+                "instance": k, "points": len(data), "quality": q,
+                "x_range": [round(min(p[0] for p in data), 4), round(max(p[0] for p in data), 4)],
+                "y_range": [round(min(p[1] for p in data), 4), round(max(p[1] for p in data), 4)],
+            })
     return {
         "panel": image_path.name,
         "frame": [left, top, right, bottom],

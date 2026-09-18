@@ -23,6 +23,68 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import extract_lines as el  # noqa: E402
 import legend_colors as lc  # noqa: E402
 
+# 可信度闸门：宁可报告"这条没提取出来"，也不要输出一条看起来像数据、实际是
+# 标注文字/图例样本的曲线。阈值偏保守，可用下面的常量调。
+MIN_SPAN_X = 0.30        # 曲线必须覆盖横轴的这么宽
+MIN_POINTS = 25          # 至少这么多个采样点
+MAX_BIG_JUMPS = 4        # 允许的"大跳变"次数（超过就判为不合理震荡）
+BIG_JUMP_FRAC = 0.25     # 多大算大跳变（占纵轴量程的比例）
+DARK_MIN_Y_SPAN = 0.12   # 黑线至少要在纵向上跨这么多，否则多半是轴线/文字行
+# 模型判定为这些角色的颜色不提取（切线/拟合线/标注/图例样本/放大子图）
+SKIP_ROLES = {"tangent", "fit", "annotation", "legend", "inset", "other", "not-data"}
+
+
+def _quality(data, xr, yr):
+    """Is this trace plausible as a single data series?"""
+    xs = [p[0] for p in data]
+    ys = [p[1] for p in data]
+    x_span = (max(xs) - min(xs)) / max(1e-9, xr[1] - xr[0])
+    y_axis = max(1e-9, yr[1] - yr[0])
+    y_span = (max(ys) - min(ys)) / y_axis
+    jumps = 0
+    if len(ys) > 1:
+        dy = np.abs(np.diff(np.array(ys, dtype=float)))
+        jumps = int((dy > BIG_JUMP_FRAC * y_axis).sum())
+    reasons = []
+    if len(data) < MIN_POINTS:
+        reasons.append(f"点数只有 {len(data)}")
+    if x_span < MIN_SPAN_X:
+        reasons.append(f"只覆盖横轴的 {x_span * 100:.0f}%（疑似标注/图例样本）")
+    if jumps > MAX_BIG_JUMPS:
+        reasons.append(f"有 {jumps} 处不合理跳变（疑似标记点/误差棒被并入）")
+    return {"ok": not reasons, "x_span": round(x_span, 3), "points": len(data),
+            "y_span": round(y_span, 3), "big_jumps": jumps, "reasons": reasons}
+
+
+def _same_line(a, b, tol=3.0, need=0.9):
+    """True when two traces are the same curve (different legend colours overlap).
+
+    Neighbouring hues share pixels - a cyan legend entry and a blue one can both
+    trace the same line - so the survivors are compared once at the end.
+
+    Compare in **pixel** space: a tolerance in data units means something different on
+    every axis (1.2 units is 8px on a 0-80 axis and half the range on a 0-2.5 one),
+    which silently merged distinct series. The tolerance is deliberately tight: three
+    real curves of the same family (800K / 946K / 1150K) run a few pixels apart and
+    must all survive.
+    """
+    by = {}
+    for x, y in b:
+        by.setdefault(x, []).append(y)
+    lo = max(min(p[0] for p in a), min(p[0] for p in b))
+    hi = min(max(p[0] for p in a), max(p[0] for p in b))
+    close = total = 0
+    for x, y in a:
+        if not (lo <= x <= hi):
+            continue
+        ys = by.get(x)
+        if not ys:
+            continue
+        total += 1
+        if min(abs(y - yy) for yy in ys) <= tol:
+            close += 1
+    return total >= 20 and close / total >= need
+
 for stream in (sys.stdout, sys.stderr):
     try:
         stream.reconfigure(encoding="utf-8", errors="replace")
@@ -32,7 +94,7 @@ for stream in (sys.stdout, sys.stderr):
 
 def process_panel(image_path, rng, outdir, sat_min, val_min, hue_tol,
                   legend_colors=None, legend_image=None, name_map=None, series_y=None,
-                  frame_hint=None):
+                  frame_hint=None, roles=None, allow_dark=False):
     xmin, xmax, ymin, ymax = rng
     img = iio.imread(image_path)
     if img is None:
@@ -41,26 +103,27 @@ def process_panel(image_path, rng, outdir, sat_min, val_min, hue_tol,
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
     left, top, right, bottom = _frame_of(gray, frame_hint)
-    inner = el.find_inner_boxes((gray < 120).astype(np.uint8) * 255)
-    legends = [b for b in inner if left < b[0] and b[1] > top
-               and b[0] + b[2] < right and b[1] + b[3] < bottom
-               and b[2] > 0.15 * (right - left)]
+    frame = (left, top, right, bottom)
+    legends = inner_boxes(gray, frame)
 
     series = []
+    skipped = []
+    kept_traces = []          # 整个面板共用：相邻色相的同一条线只保留一次
     if legend_colors:
-        # legend-driven: targets come from the figure legend, order is preserved
+        # 图例给的是颜色，不是"有几条线"：同色多条线要逐条追出来
         for spec in legend_colors:
             target = el.hex_to_bgr(spec) if isinstance(spec, str) else list(spec)
             hexs = "#{:02x}{:02x}{:02x}".format(int(target[2]), int(target[1]), int(target[0]))
+            role = ((roles or {}).get(hexs) or (roles or {}).get(hexs.upper())
+                    or (roles or {}).get(hexs.lower()) or "")
+            if role and role.lower() in SKIP_ROLES:
+                nice_early = (name_map or {}).get(hexs) or (name_map or {}).get(hexs.upper())
+                skipped.append({"color": hexs, "series_name": nice_early,
+                                "reason": f"模型判定这条不是数据线（{role}）"})
+                continue
             # each series may read a different y axis (dual-axis figures)
             y_rng = ((series_y or {}).get(hexs) or (series_y or {}).get(hexs.upper())
                      or [ymin, ymax])
-            pts = el.trace_series_by_target(hsv, (left, top, right, bottom), target,
-                                            hue_tol, exclude_boxes=legends)
-            data = el.to_data(pts, (left, top, right, bottom), xmin, xmax,
-                              y_rng[0], y_rng[1])
-            if len(data) < 20:
-                continue
             h, s, v = el.bgr_to_hsv(target)
             label = el.hue_name(h)
             nice = (name_map or {}).get(hexs) or (name_map or {}).get(hexs.upper())
@@ -68,53 +131,147 @@ def process_panel(image_path, rng, outdir, sat_min, val_min, hue_tol,
             if nice:
                 import re as _re
                 tag = _re.sub(r"[^0-9A-Za-z\u4e00-\u9fff]+", "_", nice).strip("_")[:40]
-            name = f"{image_path.stem}_{tag}.csv"
-            with (outdir / name).open("w", newline="", encoding="utf-8") as fh:
-                wr = csv.writer(fh)
-                wr.writerow(["x", "y"])
-                for xv, yv in data:
-                    wr.writerow([f"{xv:.6g}", f"{yv:.6g}"])
-            series.append({
-                "file": name,
-                "source": "legend",
-                "target_bgr": target,
-                "label": label,
-                "series_name": nice,
-                "y_axis_range": list(y_rng),
-                "points": len(data),
-                "x_range": [round(min(p[0] for p in data), 4), round(max(p[0] for p in data), 4)],
-                "y_range": [round(min(p[1] for p in data), 4), round(max(p[1] for p in data), 4)],
-            })
-    else:
-        peaks = el.detect_series_colors(hsv, (left, top, right, bottom), legends, sat_min, val_min)
-        for hue_c, count in peaks:
-            pts = el.trace_series(hsv, (left, top, right, bottom), hue_c, hue_tol, sat_min, val_min, legends)
-            data = el.to_data(pts, (left, top, right, bottom), xmin, xmax, ymin, ymax)
-            if len(data) < 20:
+            instances = el.trace_series_instances(hsv, frame, target, hue_tol,
+                                                  exclude_boxes=legends)
+            if not instances:
+                skipped.append({"color": hexs, "series_name": nice,
+                                "reason": "这个颜色没连成可用的线"})
                 continue
+            for k, pts in enumerate(instances, start=1):
+                data = el.to_data(pts, frame, xmin, xmax, y_rng[0], y_rng[1])
+                q = _quality(data, (xmin, xmax), (y_rng[0], y_rng[1]))
+                if not q["ok"]:
+                    skipped.append({"color": hexs, "series_name": nice, "instance": k,
+                                    "points": len(data), "reason": "；".join(q["reasons"])})
+                    continue
+                if any(_same_line(pts, prev) for prev in kept_traces):
+                    skipped.append({"color": hexs, "series_name": nice, "instance": k,
+                                    "points": len(data),
+                                    "reason": "与已保留的曲线重合（相邻色相互相覆盖）"})
+                    continue
+                kept_traces.append(pts)
+                name = f"{image_path.stem}_{tag}{'' if k == 1 else f'_{k}'}.csv"
+                with (outdir / name).open("w", newline="", encoding="utf-8") as fh:
+                    wr = csv.writer(fh)
+                    wr.writerow(["x", "y"])
+                    for xv, yv in data:
+                        wr.writerow([f"{xv:.6g}", f"{yv:.6g}"])
+                series.append({
+                    "file": name,
+                    "source": "legend",
+                    "target_bgr": target,
+                    "label": label,
+                    "series_name": nice,
+                    "instance": k,
+                    "y_axis_range": list(y_rng),
+                    "points": len(data),
+                    "quality": q,
+                    "x_range": [round(min(p[0] for p in data), 4), round(max(p[0] for p in data), 4)],
+                    "y_range": [round(min(p[1] for p in data), 4), round(max(p[1] for p in data), 4)],
+                })
+        if allow_dark:                      # 黑色数据线：模型确认存在时才做
+            for k, pts in enumerate(el.trace_dark_instances(gray, frame, legends,
+                                                            max_instances=2), start=1):
+                data = el.to_data(pts, frame, xmin, xmax, ymin, ymax)
+                q = _quality(data, (xmin, xmax), (ymin, ymax))
+                if not q["ok"]:
+                    skipped.append({"color": "dark", "points": len(data),
+                                    "reason": "黑线：" + "；".join(q["reasons"])})
+                    continue
+                if q["y_span"] < DARK_MIN_Y_SPAN:
+                    # 贴着坐标轴的水平暗条多半是轴线/文字行，不是数据曲线
+                    skipped.append({"color": "dark", "points": len(data),
+                                    "reason": f"黑线：几乎水平（y 只跨 {q['y_span'] * 100:.0f}% 量程），"
+                                              f"疑似轴线或文字行"})
+                    continue
+                if any(_same_line(pts, prev) for prev in kept_traces):
+                    continue
+                kept_traces.append(pts)
+                name = f"{image_path.stem}_dark{'' if k == 1 else f'_{k}'}.csv"
+                with (outdir / name).open("w", newline="", encoding="utf-8") as fh:
+                    wr = csv.writer(fh)
+                    wr.writerow(["x", "y"])
+                    for xv, yv in data:
+                        wr.writerow([f"{xv:.6g}", f"{yv:.6g}"])
+                series.append({
+                    "file": name, "source": "dark", "color": "dark", "label": "dark",
+                    "instance": k, "points": len(data), "quality": q,
+                    "x_range": [round(min(p[0] for p in data), 4), round(max(p[0] for p in data), 4)],
+                    "y_range": [round(min(p[1] for p in data), 4), round(max(p[1] for p in data), 4)],
+                })
+    else:
+        peaks = el.detect_series_colors(hsv, frame, legends, sat_min, val_min)
+        for hue_c, count in peaks:
             color = el.hue_name(hue_c)
-            name = f"{image_path.stem}_{color}.csv"
-            with (outdir / name).open("w", newline="", encoding="utf-8") as fh:
-                wr = csv.writer(fh)
-                wr.writerow(["x", "y"])
-                for xv, yv in data:
-                    wr.writerow([f"{xv:.6g}", f"{yv:.6g}"])
-            series.append({
-                "file": name,
-                "source": "hue-cluster",
-                "color": color,
-                "hue": hue_c,
-                "hue_pixels": count,
-                "points": len(data),
-                "x_range": [round(min(p[0] for p in data), 4), round(max(p[0] for p in data), 4)],
-                "y_range": [round(min(p[1] for p in data), 4), round(max(p[1] for p in data), 4)],
-            })
+            kept = 0
+            for k, pts in enumerate(
+                    el.trace_hue_instances(hsv, frame, hue_c, hue_tol, sat_min, val_min,
+                                           legends), start=1):
+                data = el.to_data(pts, frame, xmin, xmax, ymin, ymax)
+                q = _quality(data, (xmin, xmax), (ymin, ymax))
+                if not q["ok"]:
+                    if kept == 0:
+                        skipped.append({"color": color, "points": len(data),
+                                        "reason": "；".join(q["reasons"])})
+                    break
+                if any(_same_line(pts, prev) for prev in kept_traces):
+                    continue
+                kept += 1
+                kept_traces.append(pts)
+                name = f"{image_path.stem}_{color}{'' if k == 1 else f'_{k}'}.csv"
+                with (outdir / name).open("w", newline="", encoding="utf-8") as fh:
+                    wr = csv.writer(fh)
+                    wr.writerow(["x", "y"])
+                    for xv, yv in data:
+                        wr.writerow([f"{xv:.6g}", f"{yv:.6g}"])
+                series.append({
+                    "file": name,
+                    "source": "hue-cluster",
+                    "color": color,
+                    "hue": hue_c,
+                    "hue_pixels": count,
+                    "instance": k,
+                    "points": len(data),
+                    "quality": q,
+                    "x_range": [round(min(p[0] for p in data), 4), round(max(p[0] for p in data), 4)],
+                    "y_range": [round(min(p[1] for p in data), 4), round(max(p[1] for p in data), 4)],
+                })
     return {
         "panel": image_path.name,
         "frame": [left, top, right, bottom],
         "legend_boxes": legends,
         "series": series,
+        "skipped_series": skipped,
     }
+
+
+def inner_boxes(gray, frame, max_frac=0.92):
+    """Regions to mask out before tracing: legend frames and zoom insets.
+
+    Two complementary sources: rectangles formed by long straight dark lines (the
+    reliable one) and contour detection (fallback when a border is thin or partly
+    covered). Both routinely return the axes box itself - anything that covers almost
+    the whole frame is dropped, otherwise the entire plot would be masked away.
+    """
+    left, top, right, bottom = frame
+    fw, fh = max(1, right - left), max(1, bottom - top)
+    out = []
+    for (l, t, r, b) in el.find_boxes(gray)[1:]:
+        if l > left and t > top and r < right and b < bottom:
+            out.append((l, t, r - l, b - t))
+    for (x, y, w, h) in el.find_inner_boxes((gray < 120).astype(np.uint8) * 255):
+        if (x > left and y > top and x + w < right and y + h < bottom
+                and w < max_frac * fw and h < max_frac * fh):
+            out.append((x, y, w, h))
+    keep = []
+    for b in out:
+        if b[2] < 0.10 * fw or b[3] < 0.07 * fh:
+            continue
+        if any(abs(b[0] - k[0]) < 8 and abs(b[1] - k[1]) < 8
+               and abs(b[2] - k[2]) < 8 and abs(b[3] - k[3]) < 8 for k in keep):
+            continue
+        keep.append(b)
+    return keep
 
 
 def _frame_of(gray, frame_hint=None):

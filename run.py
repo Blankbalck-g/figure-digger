@@ -223,6 +223,19 @@ def _vector_inner_text(page, axes):
     return " ｜ ".join(p for p in parts if p)
 
 
+def _dark_line_wanted(panel):
+    """提取黑线只在模型确认"图里确实有一条深色数据线"时才做。
+
+    黑线默认不碰是有原因的：坐标轴、虚线网格、每个文字标注都是黑的。模型判断
+    它是数据/模型曲线时才启用，其余情况跳过，免得把文字当数据。
+    """
+    info = panel.get("vlm_dark_line") or {}
+    if not info.get("has_dark_line"):
+        return False
+    kind = str(info.get("kind") or "").strip().lower()
+    return kind in ("", "data", "model", "data_line", "model_line", "experiment")
+
+
 def _body_digest(pdf_path, want_pages=None, max_chars=12000):
     """正文里所有提到图的段落（不是全文）——按需才读。
 
@@ -598,6 +611,8 @@ def analyze(pdf_path, outdir, dpi=300, vlm=None, pages=None, use_ocr=None, want=
         legend_colors, legend_box = detect_legend_colors(fig_img)
         log(f"      图例色: {legend_colors}")
         series_sides = {}
+        series_roles = {}
+        dark_info = {}
         if vlm is not None and legend_colors:
             try:
                 nm = vt.name_series(vlm, fig_path, legend_colors)
@@ -607,9 +622,25 @@ def analyze(pdf_path, outdir, dpi=300, vlm=None, pages=None, use_ocr=None, want=
                         name_map[col] = s["label"]
                     if col and s.get("y_axis"):
                         series_sides[col] = str(s["y_axis"]).strip().lower()
+                    if col:
+                        # 模型说"这不是数据线"（切线/拟合线/标注/放大子图）就别提取
+                        role = str(s.get("role") or "").strip().lower()
+                        if s.get("is_data") is False and not role:
+                            role = "not-data"
+                        if role:
+                            series_roles[col] = role
                 log("      VLM 系列命名: " + ", ".join(f"{k}->{v}" for k, v in name_map.items()))
                 if series_sides:
                     log("      VLM 轴归属: " + ", ".join(f"{k}->{v}轴" for k, v in series_sides.items()))
+                drop = {k: v for k, v in series_roles.items()
+                        if v in ("tangent", "fit", "annotation", "legend", "inset",
+                                 "other", "not-data")}
+                if drop:
+                    log("      VLM 判定不提取: " + ", ".join(f"{k}({v})" for k, v in drop.items()))
+                dark_info = nm.get("dark_series") or {}
+                if dark_info.get("has_dark_line"):
+                    log(f"      图中有深色线：{str(dark_info.get('kind') or '?')}"
+                        f"（{str(dark_info.get('desc') or '')[:50]}）")
             except vlmc.VLMError as exc:
                 log(f"      VLM 命名失败: {exc}")
 
@@ -631,6 +662,8 @@ def analyze(pdf_path, outdir, dpi=300, vlm=None, pages=None, use_ocr=None, want=
                 "caption": caption,
                 "legend_colors": legend_colors,
                 "series_names": name_map,
+                "series_roles": series_roles,
+                "vlm_dark_line": dark_info,
                 "vlm_classification": vlm_cls,
                 "axis": {"x": None, "y": None, "confirmed": False},
             }
@@ -901,6 +934,8 @@ def extract(cfg_path, force=False, only=None, vlm=None):
                                    legend_colors=p["legend_colors"] or None,
                                    name_map=p.get("series_names") or None,
                                    series_y=series_y or None,
+                                   roles=p.get("series_roles") or None,
+                                   allow_dark=_dark_line_wanted(p),
                                    # 图里已经知道的坐标框（PDF 里量的 / 子图切分检出的），
                                    # 只在自动找框失败时才用得上
                                    frame_hint=p.get("frame"))

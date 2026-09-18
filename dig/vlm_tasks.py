@@ -42,12 +42,25 @@ NAME_SYSTEM = "你是科研论文图例解析助手，只输出 json。"
 
 NAME_PROMPT = """这张图的图例把每个数据系列标了颜色。我按顺序给出颜色，请给出对应的图例文字，只输出 json。
 示例 json 输出：
-{{"series": [{{"color": "#053856", "label": "S_tip (model from [12])", "style": "solid", "y_axis": "left"}}]}}
+{{"series": [{{"color": "#053856", "label": "S_tip (model from [12])", "style": "solid",
+             "y_axis": "left", "is_data": true, "role": "data",
+             "reason": "图例里是这个颜色的实测曲线"}}],
+ "dark_series": {{"has_dark_line": true, "kind": "model", "desc": "黑色虚线是模型预测"}}}}
 字段要求：
 - color 原样返回我给你的颜色
 - label 是图例里对应的文字；如果这个颜色在图例里找不到，label 填 null
 - style 是 solid|dashed|dashdot|marker|band 之一；无法判断填 null
 - **y_axis**：这条曲线读的是哪一条纵轴，填 "left" 或 "right"；只有一个纵轴时填 "left"
+- **is_data**：这个颜色的线是不是"要提取的实验数据曲线"。
+- **role** 只能是 data|model|tangent|fit|annotation|legend|inset|other 之一：
+  * data   = 实测/仿真得到的数据曲线（要提取）
+  * model  = 模型预测曲线（通常也要，但请在 reason 里说明）
+  * tangent/fit = 作者画的切线、拟合线、辅助斜线（形如 "S ∝ t^0.5"、"S ∝ t" 那种），**不是数据**
+  * annotation = 标注文字、箭头、"EOI"、"11 MPa" 这类注释
+  * inset = 左上/右上那种放大子图里的线
+- reason 用一句话说明判断依据（例如"这条线旁边写着 S ∝ t^0.5，是作者的斜率分析线"）
+- **dark_series**：图里有没有黑色/深灰色的线？它是数据、模型还是坐标轴辅助线？
+  有就填 has_dark_line=true 并说明；没有填 false
 颜色列表（按顺序）：{colors}"""
 
 SPOT_SYSTEM = "你是科研论文图表的读数助手，只输出 json。"

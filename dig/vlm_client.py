@@ -377,16 +377,22 @@ def log_stats(path=LOG_PATH, model=None):
 def mock_response(prompt):
     """Canned replies so the plumbing can be tested without a key."""
     p = prompt.lower()
+    # 复盘（识别出来的曲线编号画回图上，让模型核对数量/归属）
+    if "编号" in p or "merge" in p:
+        return json.dumps({"merge": [], "drop": [], "add": [], "ok": True,
+                           "note": "mock：编号与图例一一对应，没有多余或遗漏"})
     # 曲线定位（模型自己找出数据曲线 + 锚点）
     if "anchors" in p:
         return json.dumps({
             "series": [
                 {"label": "Heatedtip", "y_axis": "left", "color": "#ed464e",
-                 "linestyle": "dashed", "has_markers": True, "output": "both",
+                 "dark": False, "linestyle": "dashed", "draw": "line_only",
+                 "closed": False, "overlaps": ["Normaltip"], "occluded": [[0.62, 0.72]],
                  "anchors": [[0.08, 0.95], [0.5, 0.55], [0.92, 0.22]],
                  "note": "mock：红色虚线带方块标记"},
                 {"label": "Normaltip", "y_axis": "left", "color": "#1816c0",
-                 "linestyle": "dashed", "has_markers": True, "output": "both",
+                 "dark": False, "linestyle": "dashed", "draw": "line_only",
+                 "closed": False, "overlaps": ["Heatedtip"], "occluded": [],
                  "anchors": [[0.08, 0.97], [0.5, 0.52], [0.92, 0.20]],
                  "note": "mock：蓝色虚线带方块标记"}],
             "ignore": [{"what": "蓝色实线，旁边写着 S ∝ t^0.5",

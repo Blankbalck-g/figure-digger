@@ -245,7 +245,7 @@ def process_panel(image_path, rng, outdir, sat_min, val_min, hue_tol,
     }
 
 
-def legend_boxes(img, frame, max_frac_w=0.45, max_frac_h=0.30):
+def legend_boxes(img, frame, max_frac_w=0.60, max_frac_h=0.40):
     """图例色块的窄条（画在坐标框里面、等宽对齐的那种色块横条）。
 
     `extract_lines.find_boxes` 只认深色边构成的框，而期刊图里的图例框常常是浅灰
@@ -273,18 +273,11 @@ def legend_boxes(img, frame, max_frac_w=0.45, max_frac_h=0.30):
             continue
         sw = [s for s in lc.find_swatches(img, (x, y, w, h), min_run=12)
               if s["thickness_px"] <= 12]
-        aligned = False
-        for i in range(len(sw)):
-            for j in range(i + 1, len(sw)):
-                a, b = sw[i], sw[j]
-                short = min(a["run_len"], b["run_len"])
-                overlap = min(a["x1"], b["x1"]) - max(a["x0"], b["x0"])
-                if overlap >= 0.75 * short and abs(a["run_len"] - b["run_len"]) <= 0.5 * short:
-                    aligned = True
-                    break
-            if aligned:
-                break
-        if aligned:
+        # 只要求"框里有色块"：图例的排版很自由（三角形标记 + 点划线样本 + 文字），
+        # 硬要求"≥2 条等宽对齐的横条"会漏掉一半图例（实测 2014-01-9079 图 14 的
+        # 图例就只有一条点划线样本，于是它的样本被当成一条平线数据提了出来）。
+        # 这里清的是**色块所在的那条窄带**、而且只对同色曲线生效，风险很小。
+        if sw:
             pad = 6
             boxes.append((x, y, w, h))
             for s in sw:

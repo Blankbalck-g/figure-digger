@@ -27,12 +27,19 @@ AXIS_SYSTEM = "你是科研论文图表的读数助手，只输出 json。"
 AXIS_PROMPT = """读出这张图表坐标轴的刻度范围和刻度值，只输出 json。
 示例 json 输出：
 {{"x": {{"min": 0, "max": 5, "labels": ["0", "1", "2", "3", "4", "5"], "scale": "linear"}},
- "y_axes": [{{"side": "left", "min": 0, "max": 70, "labels": ["0", "10", "20", "30", "40", "50", "60", "70"], "scale": "linear"}}],
- "confidence": 0.9, "note": ""}}
+  "y_axes": [{{"side": "left", "min": 0, "max": 70, "labels": ["0", "10", "20", "30", "40", "50", "60", "70"],
+              "scale": "linear", "multiplier": 1e-4, "unit": "mm^3/mm^3",
+              "multiplier_note": "轴标题左上角写着 ×10^-4"}}],
+  "confidence": 0.9, "note": ""}}
 字段要求：
 - min/max 是坐标框两端对应的数值（不是数据的最小最大值，是坐标轴的范围）
 - labels 按顺序列出你能看清的刻度数字文本
 - scale 只能是 linear 或 log
+- **multiplier**：这张图有没有数量级/单位换算标注（轴旁边的 "×10^-4"、"×10^3"、
+  "1e-3"、"(×10⁻⁴)" 这类，常在轴标题或图的左上/右上角）？有就填成**乘数**
+  （例如 ×10^-4 填 0.0001），没有填 1。这条决定最终数据的数值大小，请务必看清
+  ——**注意区分是乘在 x 轴还是 y 轴**，分别填到对应的轴里
+- unit：轴标题里的单位文字（没有填 null）
 - **y_axes 是数组**：只有一个纵轴时放一个元素；若图中有左右两条纵轴，请放两个元素，
   分别用 "side": "left" / "right" 标明，并各自给出自己的 min/max/labels
 {hint}
@@ -217,20 +224,32 @@ FIND_SERIES_PROMPT = """这是一张论文插图。请找出图里**所有需要
 图例里读到的条目（供参考，可能不全）：{legend}
 只输出 json：
 {{"series": [
-  {{"label": "Normaltip", "y_axis": "left", "color": "#1816c0", "linestyle": "dashed",
-    "has_markers": true, "output": "line", "anchors": [[0.06, 0.02], [0.5, 0.55], [0.95, 0.78]],
-    "note": "两条曲线在前半段几乎重合"}}],
+  {{"label": "Normaltip", "y_axis": "left", "color": "#1816c0", "dark": false,
+    "linestyle": "dashed", "draw": "markers_connected", "closed": false,
+    "overlaps": ["Heatedtip"], "occluded": [[0.62, 0.72], [0.78, 0.60]],
+    "anchors": [[0.06, 0.02], [0.5, 0.55], [0.95, 0.78]],
+    "note": "两条曲线在前半段几乎重合，重合段压在下面"}}],
  "ignore": [{{"what": "蓝色实线，旁边写着 S ∝ t^0.5", "why": "作者的斜率参考线，不是数据"}}]}}
 字段要求：
 - label：这条曲线对应图例里的哪个条目；图例里没有就填 null 并在 note 说明
 - y_axis：读的是左轴还是右轴（只有一个纵轴时填 left）
-- color：这条线**实际**的颜色，十六进制；看不清就填 null
+- color：这条线**实际**的颜色，十六进制；黑色/灰色线填 "#000000" 并把 dark 填 true
+- **dark**：这条线是不是黑色/深灰色。黑白论文图里必须填 true——代码会改用"深色
+  笔画 + 你给的锚点"来追，不再依赖颜色
 - linestyle：solid|dashed|dashdot|marker|band
-- has_markers：曲线上有没有标记符号（三角/方块/圆点）
-- **output**：points（只要标记点的坐标）/ line（只要线的轨迹）/ both（点和线都要）
-  * 图例条目画的是标记符号、或说明里写"实验/测量"的 → points
-  * 是模型/拟合曲线（如 model、correlation、计算值）→ line
-  * 两者都有（实验点 + 拟合线画在一起）→ both
+- **draw**：这张图里**这条曲线**是怎么画出来的，四选一：
+  * markers_only        只有散点，没有连线
+  * markers_connected   散点用折线连起来（点即曲线；**不要**报成"点+线"两条）
+  * line_only           只有线，没有标记
+  * markers_plus_line   散点是实验值，另有一条**独立的**拟合/模型曲线（这才是两条）
+- **closed**：这条曲线是不是首尾相接的闭合回线（P-V 图边界、喷雾包络、等值线那种
+  围成一圈的）。普通从左到右的曲线填 false。**这条决定代码用哪种追踪方式**，填错会让
+  曲线被追成一圈来回走的假轨迹
+- **overlaps**：这条曲线与哪几条曲线有重合（颜色互相盖住）？填那些曲线的 label，
+  没有就填 []。重合处只显示上面那条的颜色是**正常的**——不要因此漏掉被压住的那条，
+  也不要把同一根线报两遍
+- **occluded**：这条曲线**自己颜色看不见**的段落，每段给一个点 [x, y]（归一化），
+  例如被另一条曲线压住、被图例框或文字盖住的位置。代码会在这些地方沿另一条曲线补全
 - **anchors**：这条曲线上三个点的**大致**位置，按 [x, y] 给，
   x、y 都是相对图片的归一化坐标（左上角 0,0，右下角 1,1），顺序为
   "从左数第一个可见点、中间一点、最右端一点"。**不要求精确**（±3% 就够），
@@ -238,14 +257,63 @@ FIND_SERIES_PROMPT = """这是一张论文插图。请找出图里**所有需要
 - note：一句话说明（例如"与另一条曲线重叠"、"前半段被图例遮住"）
 另外用 ignore 列出你**没有**当作数据的东西（作者画的斜率参考线、拟合辅助线、示意图、
 标注文字等），各写一句理由。
-注意：坐标轴、网格、图例框、纯标注文字都不是数据曲线。"""
+注意：
+1. 坐标轴、网格、图例框、纯标注文字都不是数据曲线。
+2. **一个图例条目 = 一条曲线 = 一份数据**：不要把同一根曲线的"点"和"线"报成两条
+   （散点连线的图用 draw=markers_connected）；也不要把同一根曲线因为被遮住而分成两条。
+3. 颜色相同、靠得很近的两条线（例如同色虚线）请**分别**报出来，并在 note 里说明
+   它们靠什么区分（上下位置 / 线型 / 哪一段分开）。"""
 
 
 def find_series(vlm, image_path, legend_text):
     """Ask the model where the data curves are (coarse seeds), not what our blobs are."""
     prompt = FIND_SERIES_PROMPT.format(legend=legend_text or "（没读到图例）")
     data, raw = vlm.ask_json(image_path, prompt, system=FIND_SERIES_SYSTEM, retries=2,
-                             max_tokens=1600)
+                             max_tokens=2200)
+    data["_raw"] = raw
+    return data
+
+
+REVISE_SYSTEM = "你是科研论文图表的校对助手，只输出 json。"
+
+# 复盘：模型像素上不准（所以不让它画线），但"这两条是不是同一条""这条追到图例上了"
+# 这类判断正是它的强项。把代码追出来的结果编号画回原图给它看，让它当裁判——
+# 算法在模型指导下收尾，只在有问题的面板上多问一次。
+REVISE_PROMPT = """图上是代码从这张图里追出来的曲线：彩色描边 + 编号 #1 #2 ...，
+红色 ✗ 是代码没追到的。请核对它们对不对，只输出 json：
+{{"merge": [[1, 3]], "drop": [4], "add": [], "ok": false, "note": "一句话"}}
+字段要求：
+- merge：哪两个编号其实是**同一条曲线**被重复提取了（配对给出，保留编号小的那个）。
+  颜色相同、位置重合、明显是同一根线的都算。没有填 []
+- drop：哪个编号追错了（不是数据 / 只是碎段 / 追到别的曲线或图例上 / 追到了坐标轴上 /
+  **把背景网格线或坐标框当成了曲线**——那种轨迹横跨整幅、几乎没有起伏）。没有填 []
+- add：图上有数据曲线、而代码**一条都没追上**的（注意看图例里列了、但编号里没有的）。
+  每条给：{{"label": 图例名, "color": "#rrggbb", "dark": false, "closed": false,
+  "draw": "line_only", "anchors": [[x, y], [x, y], [x, y]], "why": "哪条"}}
+  锚点必须是你能看见的、落在那条线上的点（归一化坐标，左上 0,0）。没有填 []
+- ok：上面三项都为空时填 true
+- **axis_fix**：只在**坐标轴映射明显不对**时才给（代码用的轴范围见下面的"轴的现状"）。
+  典型的错法：曲线数值整体偏移、被压成一条平线、超出轴范围、或者漏了 ×10^-4 这种
+  数量级标注。给的话写成
+  {{"x": [min, max], "y": [min, max], "multiplier": 0.0001}}
+  （multiplier 是数据要乘的倍数；分不清就只给 x/y）。没问题就不要这个字段
+- note：一句话总结（例如"#2 与 #4 是同一条，另外漏了图例里的 Ethanol"）
+判断只看图上画的描边和原图，注意：
+* **重合处只显示上面那条的颜色是正常的**，不要因为下面那条看不见就说它多余；
+* 散点用折线连起来的那种图是**一条**曲线，不是"点加线"两条；
+* 拿不准的不要动（宁可 ok=true）。
+模型最初读到的曲线清单（供参考）：{spec}
+代码实际追出来的：
+{found}
+轴的现状（代码正在用的映射）：{axis}"""
+
+
+def revise_traces(vlm, image_path, spec_text, found_text, axis_text=""):
+    """One review round: the model judges the traces the code produced."""
+    prompt = REVISE_PROMPT.format(spec=spec_text or "（无）", found=found_text or "（无）",
+                                  axis=axis_text or "（未记录）")
+    data, raw = vlm.ask_json(image_path, prompt, system=REVISE_SYSTEM, retries=2,
+                             max_tokens=900)
     data["_raw"] = raw
     return data
 

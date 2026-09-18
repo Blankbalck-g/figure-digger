@@ -429,20 +429,13 @@ def color_mask(hsv, frame, target_bgr, hue_tol=14, sat_frac=0.45, min_sat=45,
     """Pixels belonging to a legend colour, clipped to the plot area.
 
     `exclude_boxes` 里可以混着两类：4 元组 (x, y, w, h) 一律清掉；5 元组
-    (x, y, w, h, "#rrggbb") 是图例色块窄带，只对**同色**曲线生效（图例框常压在
-    数据曲线上，一条红线穿过蓝色图例条时不该被切断）。
+    (x, y, w, h, "#rrggbb") 是图例色块窄带。窄带只有十几像素高，穿过去的曲线最多
+    掉几列（追踪器自己会跨过去），所以按颜色过滤没有意义——实测图例里两条相近颜色
+    的样本会互相漏掉（2014-01-9079 图 14 的橙色样本被当成了一条平线数据）。
     """
     th, ts, tv = bgr_to_hsv(target_bgr)
     boxes = []
     for b in exclude_boxes or ():
-        if len(b) >= 5:
-            try:
-                bh = bgr_to_hsv(hex_to_bgr(str(b[4])))[0]
-            except Exception:  # noqa: BLE001
-                continue
-            dh = abs(th - bh)
-            if min(dh, 180 - dh) > max(hue_tol, 12):
-                continue
         boxes.append(tuple(b[:4]))
     hue = hsv[:, :, 0].astype(int)
     sat = hsv[:, :, 1].astype(int)

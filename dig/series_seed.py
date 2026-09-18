@@ -221,6 +221,16 @@ def color_instances(hsv, frame, color, exclude_boxes=(), hue_tol=14, sat_floor=N
     kwargs = {} if sat_floor is None else {"min_sat": sat_floor}
     mask = el.color_mask(hsv, frame, color, hue_tol, exclude_boxes=exclude_boxes,
                          **kwargs)
+    return mask_instances(mask, frame, bridge=bridge, min_px=min_px, min_span=min_span,
+                          key_prefix=(round(_hsv_of(color)[0]),))
+
+
+def mask_instances(mask, frame, bridge=31, min_px=25, min_span=0.005, key_prefix=()):
+    """任意二值掩膜的连通实例（颜色掩膜、深色线掩膜都用它）。
+
+    黑线路线（模型说 dark=true 时）复用同一套"实例 -> 候选 -> 追踪"逻辑：颜色是
+    一个掩膜，深色笔画也是一个掩膜，后面的排序（锚点命中）完全一样。
+    """
     if int((mask > 0).sum()) == 0:
         return []
     ker = cv2.getStructuringElement(cv2.MORPH_RECT, (max(3, int(bridge)), 3))
@@ -237,7 +247,7 @@ def color_instances(hsv, frame, color, exclude_boxes=(), hue_tol=14, sat_floor=N
         span = float(xs.max() - xs.min()) / frame_w
         if span < min_span:
             continue
-        out.append({"mask": comp, "key": (round(_hsv_of(color)[0]), i), "npix": npx,
+        out.append({"mask": comp, "key": tuple(key_prefix) + (i,), "npix": npx,
                     "span": round(span, 3), "x0": int(xs.min()), "x1": int(xs.max()),
                     "y0": int(ys.min()), "y1": int(ys.max())})
     out.sort(key=lambda d: -d["npix"])
@@ -347,6 +357,21 @@ def _single_blob(mask, min_share=0.9):
     return areas[0] >= min_share * max(1, sum(areas))
 
 
+def _encloses_area(mask, contour, min_ratio=2.0):
+    """这一圈是不是真的**围出了一块面积**（而不是一条线出去又回来）。
+
+    实测教训：散点+折线的曲线，标记符号让很多列出现两条以上竖切，`_looks_like_loop`
+    会误判成闭合回线，于是 CSV 沿轮廓走一圈——画出来就是一个"回路"。
+    真回线：轮廓面积 ≫ 笔画像素数（实测细笔画围的圈在 10 左右）；出去又回来的带子、
+    几条线挤成的胖块都只有 1 上下。
+    """
+    n = int((mask > 0).sum())
+    if n <= 0 or len(contour) < 20:
+        return False
+    area = abs(cv2.contourArea(np.array(contour, dtype=np.float32).reshape(-1, 1, 2)))
+    return area >= min_ratio * n
+
+
 def _contour_points(mask, frame, max_points=900):
     """沿闭合轮廓取一圈点（顺序沿曲线走，不是按 x 排序）。"""
     left, top, right, bottom = frame
@@ -449,12 +474,82 @@ def _hue_color(hsv, frame, hue, tol=8, sat_min=60, val_min=40):
     return tuple(int(t) for t in bgr)
 
 
-def _candidates_for_color(hsv, frame, color, anchors, exclude_boxes=(), hue_tol=14):
-    """该颜色的所有候选轨迹，按"离锚点多近"排好序。"""
-    insts = color_instances(hsv, frame, color, exclude_boxes, hue_tol=hue_tol)
-    if not insts:                                     # 颜色偏淡时放宽饱和下限再试一次
-        insts = color_instances(hsv, frame, color, exclude_boxes, hue_tol=hue_tol,
-                                sat_floor=40)
+def is_rule(trace, frame, flat_px=4.0, span_frac=0.6):
+    """这条轨迹是不是"一条几乎水平/垂直、横跨大半张图的直线"——网格线或坐标框。
+
+    实测：黑线路线（模型说 dark=true）里，背景的**点状网格线**是深灰的、又横跨整幅，
+    很容易被当成数据曲线追出来（用户看到的"把背景网格都识别上了"）。网格线/坐标框
+    的形态特征就是"几乎没有起伏 + 跨度极大"，真正的数据曲线极少同时满足这两条。
+    """
+    if not trace or len(trace) < 20:
+        return False
+    xs = [p[0] for p in trace]
+    ys = [p[1] for p in trace]
+    dx, dy = max(xs) - min(xs), max(ys) - min(ys)
+    fw = max(1.0, frame[2] - frame[0])
+    fh = max(1.0, frame[3] - frame[1])
+    return ((dy <= flat_px and dx >= span_frac * fw)
+            or (dx <= flat_px and dy >= span_frac * fh))
+
+
+def is_rule_line(mask, trace, frame, cover_need=0.4, band=3, beyond=2.5):
+    """这条轨迹所在的高度上，整幅图是不是都有同一条线（网格线/坐标框的碎片）。
+
+    扫描版老图里网格线是断的，追踪器只抓到其中一小段（实测 960773 图 8 里只有
+    13% 宽），光看轨迹自己"平不平"不够。判据：它所在的那条水平线上，掩膜横跨整幅
+    的比例远大于它自己占的宽度——真实数据线不会在别处也有同样的线。
+    """
+    if not trace or len(trace) < 12:
+        return False
+    xs = [p[0] for p in trace]
+    ys = [p[1] for p in trace]
+    fw = max(1.0, frame[2] - frame[0])
+    fh = max(1.0, frame[3] - frame[1])
+    x0, x1, y0, y1 = min(xs), max(xs), min(ys), max(ys)
+    if y1 - y0 <= band:
+        y = int(round((y0 + y1) / 2))
+        strip = mask[max(0, y - band):y + band + 1, frame[0] + 2:frame[2] - 1]
+        if strip.size == 0:
+            return False
+        cover = float((strip > 0).any(axis=0).mean())
+        return cover >= cover_need and cover >= beyond * (x1 - x0) / fw
+    if x1 - x0 <= band:
+        x = int(round((x0 + x1) / 2))
+        strip = mask[frame[1] + 2:frame[3] - 1, max(0, x - band):x + band + 1]
+        if strip.size == 0:
+            return False
+        cover = float((strip > 0).any(axis=1).mean())
+        return cover >= cover_need and cover >= beyond * (y1 - y0) / fh
+    return False
+
+
+def flat_run_frac(trace, tol=1.0):
+    """最长"几乎完全水平"的连续段占整条轨迹的比例。
+
+    实测：黑线路线有时会顺着一条点状网格线走很远——整条轨迹 86% 的点都在同一行
+    （真实曲线即使有平台段，这个比例也只有 3~8%，因为还有标记符号造成的微小起伏）。
+    """
+    pts = sorted(trace, key=lambda q: q[0])
+    if len(pts) < 12:
+        return 1.0
+    best = cur = 1
+    for i in range(1, len(pts)):
+        if abs(pts[i][1] - pts[i - 1][1]) <= tol:
+            cur += 1
+            best = max(best, cur)
+        else:
+            cur = 1
+    return best / float(len(pts))
+
+
+def candidates_in_mask(mask, frame, anchors, allow_loop=False, reject_rules=False):
+    """掩膜里所有候选轨迹，按"锚点命中数 -> 锚点中位距离 -> 覆盖长度"排好序。
+
+    `allow_loop` 由**模型**说了算（FIND_SERIES_PROMPT 里的 closed 字段）：闭合回线
+    要走轮廓法，普通曲线绝不能走——否则会得到一条来回折返的假轨迹（实测 2024-01-3408
+    的三条温度曲线被判成回线，画出来就是一个圈）。
+    """
+    insts = mask_instances(mask, frame)
     groups = _merge_groups(insts)
     cands = []
     for g in groups:
@@ -474,10 +569,14 @@ def _candidates_for_color(hsv, frame, color, anchors, exclude_boxes=(), hue_tol=
         if not traces:
             continue
         trace = max(traces, key=len)
+        if reject_rules and (is_rule(trace, frame)
+                             or is_rule_line(mask, trace, frame)
+                             or flat_run_frac(trace) >= 0.4):
+            continue                       # 网格线/坐标框：不是数据
         kind = "line"
-        if _looks_like_loop(g["mask"], frame) and _single_blob(g["mask"]):
+        if allow_loop and _looks_like_loop(g["mask"], frame) and _single_blob(g["mask"]):
             loop = _contour_points(g["mask"], frame)
-            if len(loop) >= 20:
+            if len(loop) >= 20 and _encloses_area(g["mask"], loop):
                 trace, kind = loop, "loop"
         hits, med = _anchor_stats(trace, anchors)
         span = (max(p[0] for p in trace) - min(p[0] for p in trace)) / \
@@ -492,7 +591,50 @@ def _candidates_for_color(hsv, frame, color, anchors, exclude_boxes=(), hue_tol=
     return cands
 
 
-def trace_series(hsv, frame, color, anchors, exclude_boxes=(), hue_tol=14, avoid=()):
+def _candidates_for_color(hsv, frame, color, anchors, exclude_boxes=(), hue_tol=14,
+                          allow_loop=False):
+    """该颜色的所有候选轨迹（颜色偏淡时放宽饱和下限再试一次）。"""
+    mask = el.color_mask(hsv, frame, color, hue_tol, exclude_boxes=exclude_boxes)
+    cands = candidates_in_mask(mask, frame, anchors, allow_loop=allow_loop)
+    if not cands:
+        mask = el.color_mask(hsv, frame, color, hue_tol, exclude_boxes=exclude_boxes,
+                             min_sat=40)
+        cands = candidates_in_mask(mask, frame, anchors, allow_loop=allow_loop)
+    return cands
+
+
+def _pick_candidate(cands, avoid=()):
+    """从排好序的候选里挑一条：跳过前面曲线已经认领过的实例。"""
+    info = {"candidates": len(cands), "avoided": 0}
+    if not cands:
+        return None, info
+    avoid = set(avoid)
+    pick = next((c for c in cands if c["key"] not in avoid), None)
+    if pick is None:                      # 全被前面的曲线认领了
+        pick = cands[0]
+        info["reused"] = True
+    else:
+        info["avoided"] = sum(1 for c in cands if c["key"] in avoid)
+    info.update({"hits": pick["hits"], "med_dist": pick["med_dist"],
+                 "span": pick["span"], "npix": pick["npix"], "key": pick["key"]})
+    return pick, info
+
+
+def trace_in_mask(mask, frame, anchors, avoid=(), allow_loop=False, reject_rules=False):
+    """在任意掩膜上按锚点挑一条轨迹（黑线路线用它）。返回 (trace, kind, info)。"""
+    info = {"mask_px": int((mask > 0).sum())}
+    cands = candidates_in_mask(mask, frame, anchors, allow_loop=allow_loop,
+                               reject_rules=reject_rules)
+    pick, pinfo = _pick_candidate(cands, avoid)
+    info.update(pinfo)
+    if pick is None:
+        info["reason"] = "掩膜里没有可用的线段（深色笔画都被判成坐标轴/文字了？）"
+        return [], "none", info
+    return pick["trace"], pick["kind"], info
+
+
+def trace_series(hsv, frame, color, anchors, exclude_boxes=(), hue_tol=14, avoid=(),
+                 allow_loop=False):
     """挑出这条曲线的轨迹。返回 (trace, kind, info)。
 
     排序原则：先看有几个锚点落在候选上（同色多实例时这是唯一可靠的信号），
@@ -504,7 +646,8 @@ def trace_series(hsv, frame, color, anchors, exclude_boxes=(), hue_tol=14, avoid
     图 2(a) 的 MeOH 图例是 hue 43，画出来的线是 hue 33，差 10 就让整条线消失。
     """
     info = {"color": [int(v) for v in color], "candidates": 0, "avoided": 0}
-    cands = _candidates_for_color(hsv, frame, color, anchors, exclude_boxes, hue_tol)
+    cands = _candidates_for_color(hsv, frame, color, anchors, exclude_boxes, hue_tol,
+                                  allow_loop=allow_loop)
     if not cands:
         base_hue = _hsv_of(color)[0]
         for h in sorted(_dominant_hues(hsv, frame),
@@ -516,25 +659,17 @@ def trace_series(hsv, frame, color, anchors, exclude_boxes=(), hue_tol=14, avoid
             if alt_color is None:
                 continue
             alt = _candidates_for_color(hsv, frame, alt_color, anchors, exclude_boxes,
-                                        hue_tol)
+                                        hue_tol, allow_loop=allow_loop)
             if alt:
                 cands = alt
                 info["color"] = [int(v) for v in alt_color]
                 info["color_shift"] = h
                 break
-    info["candidates"] = len(cands)
-    if not cands:
+    pick, pinfo = _pick_candidate(cands, avoid)
+    info.update(pinfo)
+    if pick is None:
         info["reason"] = "这个颜色在图上找不到线段（掩膜为空）"
         return [], "none", info
-    avoid = set(avoid)
-    pick = next((c for c in cands if c["key"] not in avoid), None)
-    if pick is None:                      # 全被前面的曲线认领了
-        pick = cands[0]
-        info["reused"] = True
-    else:
-        info["avoided"] = sum(1 for c in cands if c["key"] in avoid)
-    info.update({"hits": pick["hits"], "med_dist": pick["med_dist"],
-                 "span": pick["span"], "npix": pick["npix"], "key": pick["key"]})
     return pick["trace"], pick["kind"], info
 
 
@@ -844,17 +979,17 @@ def complete_trace(trace, mask, frame, occluders=(), max_jump=MAX_JUMP, max_gap=
     return out, info
 
 
-def markers_in_corridor(img, hsv, trace, color_bgr, half=22, min_markers=3):
-    """Marker glyph centres that sit **on the traced path**.
+def markers_in_mask(mask, trace, half=22, min_markers=3):
+    """标记符号的中心点（落在追踪走廊内的那些）。
 
-    Erosion keeps blobs and removes strokes (the tracer's own trick); restricting the
-    search to the corridor means text and the other curves' markers can never appear.
+    腐蚀留住团块、去掉细笔画（追踪器自己的老办法）；限制在走廊内，文字和别的曲线
+    的标记就进不来。颜色路线和深色路线共用它——模型说这条曲线带标记时，标记中心
+    比线本身更适合当数据（标记处线会被自己的符号撑出一个平台）。
     """
-    h, w = img.shape[:2]
+    h, w = mask.shape[:2]
     corridor = np.zeros((h, w), np.uint8)
     for x, y in trace:
         cv2.circle(corridor, (int(x), int(y)), half, 255, -1)
-    mask = el.color_mask(hsv, (0, 0, w - 1, h - 1), color_bgr, 12)
     m = cv2.bitwise_and(mask, corridor)
     if int((m > 0).sum()) < 60:
         return []
@@ -875,3 +1010,42 @@ def markers_in_corridor(img, hsv, trace, color_bgr, half=22, min_markers=3):
     keep = [b for b in blobs if 0.35 * med <= b["area"] <= 3.0 * med]
     keep.sort(key=lambda b: b["cx"])
     return [(b["cx"], b["cy"]) for b in keep]
+
+
+def markers_in_corridor(img, hsv, trace, color_bgr, half=22, min_markers=3):
+    """Marker glyph centres that sit **on the traced path**（颜色路线的入口）。"""
+    h, w = img.shape[:2]
+    mask = el.color_mask(hsv, (0, 0, w - 1, h - 1), color_bgr, 12)
+    return markers_in_mask(mask, trace, half=half, min_markers=min_markers)
+
+
+def line_through_markers(markers, min_dx=2.0):
+    """把标记中心连成曲线（散点+折线那种图，点即曲线）。
+
+    比沿画出来的线追踪更准：线会被标记符号撑出平台、被别的曲线盖住，而标记中心
+    是画图时真正的数据点位置。
+    """
+    out = []
+    for x, y in sorted(markers):
+        if out and abs(x - out[-1][0]) < min_dx:
+            continue
+        out.append((float(x), float(y)))
+    return out
+
+
+def snap_line_to_markers(trace, markers, half_w=7.0):
+    """线轨迹穿过标记符号时会被符号的边缘带成平台：在标记的横向范围内改用标记中心。"""
+    if not trace or not markers:
+        return list(trace)
+    ys = sorted((float(m[0]), float(m[1])) for m in markers)
+    out = []
+    for x, y in trace:
+        x = float(x)
+        # 找最近的标记中心（按 x）
+        best = None
+        for mx, my_ in ys:
+            d = abs(mx - x)
+            if d <= half_w and (best is None or d < best[0]):
+                best = (d, my_)
+        out.append((x, best[1] if best else float(y)))
+    return out

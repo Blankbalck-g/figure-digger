@@ -256,7 +256,10 @@ def inner_boxes(gray, frame, max_frac=0.92):
     left, top, right, bottom = frame
     fw, fh = max(1, right - left), max(1, bottom - top)
     out = []
-    for (l, t, r, b) in el.find_boxes(gray)[1:]:
+    # 内部小框（图例/放大子图）的边比坐标框短得多：主检测用 40% 图宽作门槛时，
+    # 嵌在绘图区里的图例框常常差一点点而漏掉（实测 2014-01-1413 p14），
+    # 所以这里单独放宽到 15% 再筛"是不是在坐标框里面"。
+    for (l, t, r, b) in el.find_boxes(gray, min_run_frac=0.15)[1:]:
         if l > left and t > top and r < right and b < bottom:
             out.append((l, t, r - l, b - t))
     for (x, y, w, h) in el.find_inner_boxes((gray < 120).astype(np.uint8) * 255):

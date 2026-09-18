@@ -65,6 +65,7 @@ import batch_extract as be  # noqa: E402
 import extract_lines as el  # noqa: E402
 import figure_index as fi  # noqa: E402
 import legend_colors as lc  # noqa: E402
+import objects as ob  # noqa: E402
 import split_panels as sp  # noqa: E402
 import triage_pdf as tp  # noqa: E402
 import verify_overlay as vo  # noqa: E402
@@ -396,7 +397,7 @@ def print_vlm_usage(client, phase, before=None):
 
 
 def analyze(pdf_path, outdir, dpi=300, vlm=None, pages=None, use_ocr=None, want=None,
-            want_deep=False):
+            want_deep=False, judge_objects=True):
     """use_ocr=None means "auto": with a VLM the model is the primary axis reader and
     OCR (5-10x slower, same job) stays off; without one OCR is the only reader left."""
     if use_ocr is None:
@@ -406,6 +407,8 @@ def analyze(pdf_path, outdir, dpi=300, vlm=None, pages=None, use_ocr=None, want=
     outdir = Path(outdir).resolve()
     (outdir / "figures").mkdir(parents=True, exist_ok=True)
     (outdir / "panels").mkdir(parents=True, exist_ok=True)
+    if judge_objects and vlm is not None:
+        (outdir / "objects").mkdir(parents=True, exist_ok=True)
     if use_ocr:
         (outdir / "debug").mkdir(parents=True, exist_ok=True)
     elif vlm is not None:
@@ -733,6 +736,39 @@ def analyze(pdf_path, outdir, dpi=300, vlm=None, pages=None, use_ocr=None, want=
                 log("      逐曲线轴指派: " + ("; ".join(pairs) if pairs else "（VLM 未给出归属，统一用左轴）"))
             entry["series_axes"] = series_sides
 
+            # ---- 物件级判定：让模型看着编号裁图说清"哪根是哪根" ----
+            # 这里是模型"懂"的地方：作者画的斜率参考线（旁边写着 S ∝ t^0.5 那种）、
+            # 图例中没有对应条目的线、纯标注，都在这一步被点出来并与图例条目挂钩。
+            if vlm is not None and judge_objects:
+                try:
+                    panel_img = iio.imread(panel_path)
+                    gray_p = cv2.cvtColor(panel_img, cv2.COLOR_BGR2GRAY)
+                    inner_p = be.inner_boxes(gray_p, frame)
+                    objs = ob.detect_objects(panel_img, frame, inner_p)
+                    if objs:
+                        sheet = outdir / "objects" / f"{pid}_objects.png"
+                        ob.render_sheet(panel_img, objs, frame, sheet)
+                        legend_text = "、".join(
+                            f"{v}（{k}）" for k, v in (name_map or {}).items()
+                        ) or "、".join(legend_colors)
+                        dec = vt.judge_objects(vlm, sheet, legend_text,
+                                               ob.evidence_text(objs, frame))
+                        entry["objects"] = {
+                            "sheet": str(sheet.relative_to(outdir)) if sheet.is_relative_to(outdir) else str(sheet),
+                            "decisions": dec.get("objects") or [],
+                            "notes": dec.get("notes"),
+                        }
+                        for d in entry["objects"]["decisions"]:
+                            log(f"      物件#{d.get('id')}: {str(d.get('what'))[:44]}"
+                                f" → is_data={d.get('is_data')} belongs={d.get('belongs_to')}"
+                                f" output={d.get('output')}")
+                            if str(d.get("output") or "").lower() == "skip" or d.get("is_data") is False:
+                                log(f"          （跳过：{str(d.get('reason') or '')[:70]}）")
+                except vlmc.VLMError as exc:
+                    log(f"      物件判定失败: {exc}")
+                except Exception as exc:  # noqa: BLE001
+                    log(f"      物件判定异常: {type(exc).__name__}: {exc}")
+
             # Not-a-line-chart filter: needs both no readable ticks AND no curve-like
             # pixel content. Photos/schematics fail on both counts; a line chart only
             # has to pass one of them.
@@ -831,6 +867,17 @@ def write_report(config, path, phase, results=None):
                     f"R²={o['r2']}, 步长={o['step']}, 吸附={'是' if o['snapped'] else '否'}"
                     + (f", 离群={o['outliers']}" if o["outliers"] else "")
                     + (f", 已修复={o['repaired']}" if o["repaired"] else ""))
+        objs = p.get("objects")
+        if objs and objs.get("decisions"):
+            lines.append(f"- 物件判定（对照图 `{objs.get('sheet')}`，逐个编号判断「哪根是哪根」）:")
+            for d in objs["decisions"]:
+                mark = "✅ 提取" if (d.get("is_data") and str(d.get("output")).lower() != "skip") \
+                    else "⏭️ 跳过"
+                lines.append(f"  - #{d.get('id')} {mark} ｜ {d.get('what')} ｜ "
+                             f"归属={d.get('belongs_to') or '（无对应图例条目）'} ｜ "
+                             f"输出={d.get('output')}")
+                if d.get("reason"):
+                    lines.append(f"    - 依据: {d['reason']}")
         if results and p["id"] in results:
             r = results[p["id"]]
             lines.append(f"- 提取结果: {len(r['series'])} 条曲线")
@@ -1026,10 +1073,11 @@ def extract(cfg_path, force=False, only=None, vlm=None):
     return results
 
 
-def _run_one(pdf, sub, row, dpi, pages, force, vlm, use_ocr, want=None, want_deep=False):
+def _run_one(pdf, sub, row, dpi, pages, force, vlm, use_ocr, want=None, want_deep=False,
+             judge_objects=True):
     """One PDF end-to-end (analyze + extract). Shared by serial and parallel batch."""
     cfg = analyze(pdf, sub, dpi=dpi, vlm=vlm, pages=pages, use_ocr=use_ocr, want=want,
-                  want_deep=want_deep)
+                  want_deep=want_deep, judge_objects=judge_objects)
     config = json.loads(Path(cfg).read_text(encoding="utf-8"))
     if config.get("selection"):
         row["matched"] = len(config["selection"].get("ids") or [])
@@ -1061,7 +1109,7 @@ def _log_row(row, with_vlm):
 
 
 def _batch_one(pdf_str, sub_str, dpi, pages, force, vlm_spec, use_ocr, want=None,
-               want_deep=False):
+               want_deep=False, judge_objects=True):
     """Worker body for --jobs > 1: one PDF per process.
 
     Output goes to that paper's own run.log - several processes printing to one terminal
@@ -1081,7 +1129,8 @@ def _batch_one(pdf_str, sub_str, dpi, pages, force, vlm_spec, use_ocr, want=None
             if not client.api_key:
                 client = None
         _LOG_FILE = (sub / "run.log").open("w", encoding="utf-8")
-        _run_one(pdf, sub, row, dpi, pages, force, client, use_ocr, want, want_deep)
+        _run_one(pdf, sub, row, dpi, pages, force, client, use_ocr, want, want_deep,
+                 judge_objects)
     except Exception as exc:  # noqa: BLE001
         row["error"] = f"{type(exc).__name__}: {exc}"
         log(f"  ✗ 失败: {row['error']}")
@@ -1098,7 +1147,7 @@ def _batch_one(pdf_str, sub_str, dpi, pages, force, vlm_spec, use_ocr, want=None
 
 
 def _batch_serial(pdfs, outdir, dpi, pages, force, vlm, use_ocr, want=None,
-                  want_deep=False):
+                  want_deep=False, judge_objects=True):
     rows = []
     for i, pdf in enumerate(pdfs, start=1):
         t_file = time.time()
@@ -1107,7 +1156,8 @@ def _batch_serial(pdfs, outdir, dpi, pages, force, vlm, use_ocr, want=None,
         before = dict(vlm.usage) if vlm is not None else None
         row = new_row(pdf, sub)
         try:
-            _run_one(pdf, sub, row, dpi, pages, force, vlm, use_ocr, want, want_deep)
+            _run_one(pdf, sub, row, dpi, pages, force, vlm, use_ocr, want, want_deep,
+                     judge_objects)
         except Exception as exc:  # noqa: BLE001
             row["error"] = f"{type(exc).__name__}: {exc}"
             log(f"  ✗ 失败: {row['error']}")
@@ -1123,14 +1173,15 @@ def _batch_serial(pdfs, outdir, dpi, pages, force, vlm, use_ocr, want=None,
 
 
 def _batch_parallel(pdfs, outdir, jobs, dpi, pages, force, vlm, use_ocr, want=None,
-                    want_deep=False):
+                    want_deep=False, judge_objects=True):
     from concurrent.futures import ProcessPoolExecutor, as_completed
 
     spec = {"model": vlm.model, "base_url": vlm.base_url} if vlm is not None else None
     rows, done = [], 0
     with ProcessPoolExecutor(max_workers=jobs) as ex:
         futures = {ex.submit(_batch_one, str(pdf), str(outdir / pdf.stem), dpi, pages,
-                             force, spec, use_ocr, want, want_deep): pdf for pdf in pdfs}
+                             force, spec, use_ocr, want, want_deep,
+                             judge_objects): pdf for pdf in pdfs}
         for fut in as_completed(futures):
             pdf = futures[fut]
             done += 1
@@ -1148,7 +1199,7 @@ def _batch_parallel(pdfs, outdir, jobs, dpi, pages, force, vlm, use_ocr, want=No
 
 def batch(dir_path, outdir, dpi=300, vlm=None, pages=None, force=False,
           pattern="*.pdf", recursive=False, use_ocr=True, jobs=1, want=None,
-          want_deep=False):
+          want_deep=False, judge_objects=True):
     """Process every PDF in a folder, then write a combined summary.
 
     jobs=1 keeps everything in one process (shared OCR engine / VLM client and caches).
@@ -1173,14 +1224,14 @@ def batch(dir_path, outdir, dpi=300, vlm=None, pages=None, force=False,
 
     if jobs > 1:
         rows = _batch_parallel(pdfs, outdir, jobs, dpi, pages, force, vlm, use_ocr, want,
-                               want_deep)
+                               want_deep, judge_objects)
         # 用量在子进程里累计，父进程按行加总后再打印
         if vlm is not None:
             for k in vlm.usage:
                 vlm.usage[k] = sum(r.get("usage", {}).get(k, 0) for r in rows)
     else:
         rows = _batch_serial(pdfs, outdir, dpi, pages, force, vlm, use_ocr, want,
-                             want_deep)
+                             want_deep, judge_objects)
 
     md = ["# 批量提取汇总", "",
           f"- 来源目录: `{src}`", f"- 处理文件: {len(pdfs)} 个", ""]
@@ -1273,6 +1324,8 @@ def main():
                    help="用一句话说要哪些图，如 --want \"800 bar 下速度随时间的折线图\"")
     a.add_argument("--want-deep", action="store_true",
                    help="再用正文里提到图的段落判定一次（更准，每篇约 ¥0.02）")
+    a.add_argument("--no-object-judge", action="store_true",
+                   help="跳过物件级判定（省掉每面板一次调用，但就分不清哪根线是数据）")
 
     e = sub.add_parser("extract", help="按配置提取数据（只跑已确认的面板）")
     e.add_argument("config")
@@ -1302,6 +1355,7 @@ def main():
     al.add_argument("--ocr", action="store_true", help="即使启用 VLM 也跑 OCR 交叉核对")
     al.add_argument("--want", default=None, help="用一句话说要哪些图（见 README）")
     al.add_argument("--want-deep", action="store_true", help="再用正文段落判定一次")
+    al.add_argument("--no-object-judge", action="store_true", help="跳过物件级判定")
 
     b = sub.add_parser("batch", help="批量处理一个目录下的所有 PDF，并输出汇总")
     b.add_argument("dir")
@@ -1321,6 +1375,7 @@ def main():
     b.add_argument("--want", default=None,
                    help="用一句话说要哪些图；每篇都按同一句需求筛")
     b.add_argument("--want-deep", action="store_true", help="再用正文段落判定一次")
+    b.add_argument("--no-object-judge", action="store_true", help="跳过物件级判定")
 
     sub.add_parser("doctor", help="环境自检：解释器、依赖、API key")
 
@@ -1356,7 +1411,8 @@ def main():
 
     if args.cmd == "analyze":
         analyze(args.pdf, args.out, args.dpi, vlm=make_vlm(), pages=args.pages,
-                use_ocr=use_ocr(), want=args.want, want_deep=args.want_deep)
+                use_ocr=use_ocr(), want=args.want, want_deep=args.want_deep,
+                judge_objects=not args.no_object_judge)
     elif args.cmd == "extract":
         extract(args.config, force=args.force,
                 only=set(args.only) if args.only else None, vlm=make_vlm())
@@ -1365,7 +1421,8 @@ def main():
     elif args.cmd == "all":
         client = make_vlm()
         cfg = analyze(args.pdf, args.out, args.dpi, vlm=client, pages=args.pages,
-                      use_ocr=use_ocr(), want=args.want, want_deep=args.want_deep)
+                      use_ocr=use_ocr(), want=args.want, want_deep=args.want_deep,
+                      judge_objects=not args.no_object_judge)
         extract(cfg, force=args.force, vlm=client)
         if client is not None:
             print_vlm_usage(client, "本次合计")
@@ -1373,7 +1430,7 @@ def main():
         batch(args.dir, args.out, dpi=args.dpi, vlm=make_vlm(), pages=args.pages,
               force=args.force, pattern=args.pattern, recursive=args.recursive,
               use_ocr=use_ocr(), jobs=args.jobs, want=args.want,
-              want_deep=args.want_deep)
+              want_deep=args.want_deep, judge_objects=not args.no_object_judge)
     elif args.cmd == "doctor":
         doctor()
 

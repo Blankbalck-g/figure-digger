@@ -208,6 +208,44 @@ def select_figures_by_body(vlm, want, index_text, body_text):
     return data
 
 
+OBJECT_SYSTEM = "你是科研论文图表的读图助手，只输出 json。"
+
+OBJECT_PROMPT = """这张论文插图的绘图区里，我检测出 {n} 个候选物件。
+左边是原图（每个候选物件用红框标出并编号），右边是把每个物件单独放大的对照图（编号在左上角）。
+图例里读到的条目：{legend}
+每个物件的客观信息（代码量的，供你参考）：
+{objects}
+
+请逐个判断它们分别是什么，只输出 json：
+{{"objects": [{{"id": 1, "what": "蓝色虚线，带三角标记", "is_data": true,
+  "belongs_to": "Normaltip", "output": "line",
+  "reason": "图例里 Normaltip 就是蓝色虚线"}}], "notes": ""}}
+字段要求：
+- what：一句话客观描述这个物件（颜色 + 线型 + 有没有标记符号 + 旁边有没有文字）
+- is_data：它是不是**用户要提取的数据**。作者画的斜率参考线（如旁边写着 S ∝ t^0.5）、拟合线、
+  示意线、坐标辅助线、纯文字/箭头标注 → false
+- belongs_to：对应图例里的哪个条目；**对不上任何条目就填 null**
+- output：points（这一系列要"标记点的坐标"）/ line（要"线的轨迹"）/
+  both（点和线都要，分成两个产物）/ skip（不提取）
+- reason：一句话依据。**判 false 或 skip 时一定要写清理由**（例如"图例只有 Heatedtip 与 Normaltip
+  两个条目，这个物件没有对应条目，是作者的斜率分析线"）
+注意：
+- 同一根线被拆成几个编号时，只有最长的那段填 output，其余填 skip 并写明"是 #N 的一段"
+- 图例条目是"标记符号"（如 ▽）的多半要 points；图例条目是"线型"（如 —·—）的多半要 line
+- 不确定就填 skip，并在 reason 里说明，不要猜"""
+
+
+def judge_objects(vlm, sheet_path, legend_text, objects_text):
+    """Ask the model what each detected object is, and what to do with it."""
+    n = objects_text.count("\n") + 1 if objects_text.strip() else 0
+    prompt = OBJECT_PROMPT.format(n=n, legend=legend_text or "（没读到图例）",
+                                  objects=objects_text or "（无）")
+    data, raw = vlm.ask_json(sheet_path, prompt, system=OBJECT_SYSTEM, retries=2,
+                             max_tokens=1600)
+    data["_raw"] = raw
+    return data
+
+
 def compare_spot_check(checks, expected, tol_abs, tol_by_id=None):
     """Attach our own traced value and an agreement verdict to each VLM reading.
 

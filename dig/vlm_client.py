@@ -377,6 +377,20 @@ def log_stats(path=LOG_PATH, model=None):
 def mock_response(prompt):
     """Canned replies so the plumbing can be tested without a key."""
     p = prompt.lower()
+    # 物件判定（"哪根是哪根"）
+    if "候选物件" in prompt:
+        return json.dumps({"objects": [
+            {"id": 1, "what": "蓝色虚线（带标记）", "is_data": True,
+             "belongs_to": "Normaltip", "output": "line",
+             "reason": "mock：图例 Normaltip 就是蓝色虚线"},
+            {"id": 2, "what": "红色虚线", "is_data": True, "belongs_to": "Heatedtip",
+             "output": "line", "reason": "mock：图例 Heatedtip 就是红色虚线"},
+            {"id": 3, "what": "蓝色实线，旁边写着 S ∝ t^0.5", "is_data": False,
+             "belongs_to": None, "output": "skip",
+             "reason": "mock：没有对应图例条目，是作者画的斜率参考线"},
+            {"id": 4, "what": "文字标注块", "is_data": False, "belongs_to": None,
+             "output": "skip", "reason": "mock：纯标注"}],
+            "notes": "mock reply"})
     # 选图（三档里最先判，因为它的提示词里也含"图例"等词）
     if "shortlist" in p:
         if "不存在" in p:

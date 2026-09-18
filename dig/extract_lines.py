@@ -522,12 +522,12 @@ def _clip_and_mask(mask, frame, exclude_boxes):
 
 
 def _instances_from_mask(mask, frame, max_instances, min_points, min_span, erase_width,
-                         validator=None):
+                         validator=None, max_gap=None):
     left, _, right, _ = frame
     frame_w = max(1, right - left)
     out = []
     for _ in range(max(1, max_instances)):
-        pts = _trace_mask(mask, frame)
+        pts = _trace_mask(mask, frame) if max_gap is None else _trace_mask(mask, frame, max_gap=max_gap)
         if len(pts) < min_points:
             break
         xs = [p[0] for p in pts]

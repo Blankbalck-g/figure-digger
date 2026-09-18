@@ -65,7 +65,6 @@ import batch_extract as be  # noqa: E402
 import extract_lines as el  # noqa: E402
 import figure_index as fi  # noqa: E402
 import legend_colors as lc  # noqa: E402
-import objects as ob  # noqa: E402
 import split_panels as sp  # noqa: E402
 import triage_pdf as tp  # noqa: E402
 import verify_overlay as vo  # noqa: E402
@@ -242,42 +241,20 @@ def _dark_line_wanted(panel):
 
 
 def _extract_panel(panel, panel_path, rng, csv_dir):
-    """Pick one series,两种方式：模型逐物件判定（优先）或按颜色追踪（回退）。
+    """两种方式：模型给锚点 + 代码精确追踪（优先），或按颜色全局追踪（回退）。
 
-    物件路线是"模型负责懂、代码负责准"的落地点：模型说哪个物件是数据、要出点还是出线，
-    代码就用那个物件自己的像素去算（标记取中心、线取轨迹）。没有判定结果时（没开
-    --vlm、判定失败、或用户用 --no-object-judge 关掉了）自动回退到颜色追踪。
+    锚点路线的分工：模型说"有哪几条曲线、大概在哪"，代码在锚点附近取色、从锚点向
+    两端连续性追踪、换算成数值。模型不再评价候选清单，所以不会出现"数据被跳过"；
+    追不到的会作为 failed 明确报告，而不是静默消失。
     """
-    decisions = (panel.get("objects") or {}).get("decisions") or []
-    if decisions:
+    spec = panel.get("series_spec") or []
+    if spec:
         try:
-            outdir = Path(csv_dir).parent
-            frame_p = tuple(panel.get("frame") or ())
-            # 几何优先用分析阶段存下来的那一份：编号必须和模型判定时看到的一致
-            geom = (panel.get("objects") or {}).get("geometry")
-            objs = None
-            if geom:
-                gp = Path(geom)
-                objs = ob.load_objects(gp if gp.is_absolute() else outdir / gp)
-            if objs is None:
-                panel_img = iio.imread(panel_path)
-                if panel_img is not None:
-                    gray_p = cv2.cvtColor(panel_img, cv2.COLOR_BGR2GRAY)
-                    frame_p = be._frame_of(gray_p, panel.get("frame"))
-                    objs = ob.detect_objects(panel_img, frame_p,
-                                             be.inner_boxes(gray_p, frame_p))
-                    log("      ⚠ 该面板没有保存的物件几何，改用现场检测——"
-                        "编号可能与模型判定时不一致，建议重跑 analyze")
-            if objs:
-                if not frame_p:
-                    frame_p = tuple(panel.get("frame") or ())
-                series, skipped = be.process_objects(panel_path, frame_p, objs, decisions,
-                                                     rng, csv_dir)
-                if series or skipped:
-                    return {"panel": panel_path.name, "frame": list(frame_p),
-                            "series": series, "skipped_series": skipped, "method": "objects"}
+            res = _extract_seeded(panel, panel_path, rng, csv_dir, spec)
+            if res is not None:
+                return res
         except Exception as exc:  # noqa: BLE001
-            log(f"      （物件路线失败，回退颜色追踪：{type(exc).__name__}: {exc}）")
+            log(f"      （锚点路线失败，回退颜色追踪：{type(exc).__name__}: {exc}）")
     try:
         return be.process_panel(
             panel_path, rng, csv_dir, sat_min=70, val_min=40, hue_tol=16,
@@ -290,6 +267,73 @@ def _extract_panel(panel, panel_path, rng, csv_dir):
     except Exception as exc:  # noqa: BLE001
         log(f"{panel['id']}: ✗ 提取失败 {type(exc).__name__}: {exc}")
         return None
+
+
+def _extract_seeded(panel, panel_path, rng, csv_dir, spec):
+    """按"模型锚点 → 代码追踪"提取；返回 None 表示这条路线不可用（回退）。"""
+    import series_seed as ss
+    img = iio.imread(panel_path)
+    if img is None:
+        return None
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    frame = be._frame_of(gray, panel.get("frame"))
+    exclude = be.inner_boxes(gray, frame)
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    xmin, xmax, ymin, ymax = rng
+    series, failed = [], []
+    for s in spec:
+        anchors = ss.anchors_to_pixels(s.get("anchors"), frame, (img.shape[1], img.shape[0]))
+        if not anchors:
+            failed.append({"label": s.get("label"), "reason": "模型没给出可用的锚点坐标"})
+            continue
+        color = ss.sample_color(img, anchors)
+        if color is None and s.get("color"):
+            try:
+                color = tuple(el.hex_to_bgr(s["color"]))
+            except Exception:  # noqa: BLE001
+                color = None
+        if color is None:
+            failed.append({"label": s.get("label"), "reason": "锚点附近取不到颜色"})
+            continue
+        trace, info = ss.trace_best(img, hsv, frame, anchors, color, exclude)
+        if len(trace) < 20 or (info.get("coverage") or 0) < 0.12:
+            failed.append({"label": s.get("label"),
+                           "reason": f"从锚点追踪失败（种子命中 {info.get('seeded')}/{len(anchors)} 个锚点）",
+                           "anchors": s.get("anchors")})
+            continue
+        label = ss.safe_tag(s.get("label") or f"series{len(series) + 1}")
+        want = str(s.get("output") or "line").lower()
+        line_data = el.to_data(trace, frame, xmin, xmax, ymin, ymax)
+        points = ss.markers_in_corridor(img, hsv, trace, color) if s.get("has_markers") else []
+        point_data = el.to_data(points, frame, xmin, xmax, ymin, ymax) if points else []
+        emitted = []
+        if want in ("points", "both") and len(point_data) >= 3:
+            name = ss.unique_path(csv_dir, f"{panel_path.stem}_{label}.csv")
+            ss.write_csv(name, point_data)
+            emitted.append(("points", name))
+        if want in ("line", "both") and len(line_data) >= 20:
+            suffix = "_line" if emitted else ""       # 有标记点时，主文件是数据点
+            name = ss.unique_path(csv_dir, f"{panel_path.stem}_{label}{suffix}.csv")
+            ss.write_csv(name, line_data)
+            emitted.append(("line", name))
+        if not emitted:
+            failed.append({"label": s.get("label"), "reason": "追踪出的点太少，未写出"})
+            continue
+        for kind, name in emitted:
+            data = point_data if kind == "points" else line_data
+            series.append({
+                "file": name.name, "source": "seeded", "kind": kind,
+                "series_name": s.get("label"), "output": want,
+                "color_hex": s.get("color"), "y_axis": s.get("y_axis"),
+                "anchors": s.get("anchors"), "note": s.get("note"),
+                "coverage": info.get("coverage"), "points": len(data),
+                "x_range": [round(min(p[0] for p in data), 4), round(max(p[0] for p in data), 4)],
+                "y_range": [round(min(p[1] for p in data), 4), round(max(p[1] for p in data), 4)],
+            })
+    if not series and not failed:
+        return None
+    return {"panel": panel_path.name, "frame": list(frame), "series": series,
+            "failed": failed, "method": "seeded"}
 
 
 def series_y_from(panel):
@@ -462,7 +506,7 @@ def print_vlm_usage(client, phase, before=None):
 
 
 def analyze(pdf_path, outdir, dpi=300, vlm=None, pages=None, use_ocr=None, want=None,
-            want_deep=False, judge_objects=True):
+            want_deep=False, find_series=True):
     """use_ocr=None means "auto": with a VLM the model is the primary axis reader and
     OCR (5-10x slower, same job) stays off; without one OCR is the only reader left."""
     if use_ocr is None:
@@ -472,7 +516,7 @@ def analyze(pdf_path, outdir, dpi=300, vlm=None, pages=None, use_ocr=None, want=
     outdir = Path(outdir).resolve()
     (outdir / "figures").mkdir(parents=True, exist_ok=True)
     (outdir / "panels").mkdir(parents=True, exist_ok=True)
-    if judge_objects and vlm is not None:
+    if find_series and vlm is not None:
         (outdir / "objects").mkdir(parents=True, exist_ok=True)
     if use_ocr:
         (outdir / "debug").mkdir(parents=True, exist_ok=True)
@@ -803,39 +847,32 @@ def analyze(pdf_path, outdir, dpi=300, vlm=None, pages=None, use_ocr=None, want=
             entry["series_axes"] = series_sides
 
             # ---- 物件级判定：让模型看着编号裁图说清"哪根是哪根" ----
-            # 这里是模型"懂"的地方：作者画的斜率参考线（旁边写着 S ∝ t^0.5 那种）、
-            # 图例中没有对应条目的线、纯标注，都在这一步被点出来并与图例条目挂钩。
-            if vlm is not None and judge_objects:
+            # 让模型**自己指出**数据曲线和它们的大致位置（锚点），代码再从锚点精确追踪。
+            # 关键在于模型输出的是"要提取什么"（正向清单），不再是"我给的候选里哪个不是"
+            # ——后者必然出现"数据被 skip 掉、该 skip 的却留下"。
+            if vlm is not None and find_series:
                 try:
-                    panel_img = iio.imread(panel_path)
-                    gray_p = cv2.cvtColor(panel_img, cv2.COLOR_BGR2GRAY)
-                    inner_p = be.inner_boxes(gray_p, frame)
-                    objs = ob.detect_objects(panel_img, frame, inner_p)
-                    if objs:
-                        sheet = outdir / "objects" / f"{pid}_objects.png"
-                        ob.render_sheet(panel_img, objs, frame, sheet)
-                        legend_text = "、".join(
-                            f"{v}（{k}）" for k, v in (name_map or {}).items()
-                        ) or "、".join(legend_colors)
-                        dec = vt.judge_objects(vlm, sheet, legend_text,
-                                               ob.evidence_text(objs, frame))
-                        geom = ob.save_objects(objs, outdir / "objects" / f"{pid}_objects.json")
-                        entry["objects"] = {
-                            "sheet": str(sheet.relative_to(outdir)) if sheet.is_relative_to(outdir) else str(sheet),
-                            "geometry": str(geom.relative_to(outdir)) if geom.is_relative_to(outdir) else str(geom),
-                            "decisions": dec.get("objects") or [],
-                            "notes": dec.get("notes"),
-                        }
-                        for d in entry["objects"]["decisions"]:
-                            log(f"      物件#{d.get('id')}: {str(d.get('what'))[:44]}"
-                                f" → is_data={d.get('is_data')} belongs={d.get('belongs_to')}"
-                                f" output={d.get('output')}")
-                            if str(d.get("output") or "").lower() == "skip" or d.get("is_data") is False:
-                                log(f"          （跳过：{str(d.get('reason') or '')[:70]}）")
+                    legend_text = "、".join(
+                        f"{v}（{k}）" for k, v in (name_map or {}).items()
+                    ) or "、".join(legend_colors)
+                    found = vt.find_series(vlm, panel_path, legend_text)
+                    spec = [s for s in (found.get("series") or []) if isinstance(s, dict)]
+                    if spec:
+                        entry["series_spec"] = spec
+                        entry["ignore"] = found.get("ignore") or []
+                        for s in spec:
+                            a = s.get("anchors") or []
+                            log(f"      模型指出曲线: {str(s.get('label'))[:26]:<26}"
+                                f" 颜色={s.get('color')} 线型={s.get('linestyle')}"
+                                f" 标记={s.get('has_markers')} 输出={s.get('output')}"
+                                f" 锚点={len(a)}")
+                        for ig in entry["ignore"]:
+                            log(f"      模型指出忽略: {str(ig.get('what'))[:44]}"
+                                f"（{str(ig.get('why'))[:40]}）")
                 except vlmc.VLMError as exc:
-                    log(f"      物件判定失败: {exc}")
+                    log(f"      曲线定位失败: {exc}")
                 except Exception as exc:  # noqa: BLE001
-                    log(f"      物件判定异常: {type(exc).__name__}: {exc}")
+                    log(f"      曲线定位异常: {type(exc).__name__}: {exc}")
 
             # Not-a-line-chart filter: needs both no readable ticks AND no curve-like
             # pixel content. Photos/schematics fail on both counts; a line chart only
@@ -935,19 +972,16 @@ def write_report(config, path, phase, results=None):
                     f"R²={o['r2']}, 步长={o['step']}, 吸附={'是' if o['snapped'] else '否'}"
                     + (f", 离群={o['outliers']}" if o["outliers"] else "")
                     + (f", 已修复={o['repaired']}" if o["repaired"] else ""))
-        objs = p.get("objects")
-        if objs and objs.get("decisions"):
-            lines.append(f"- 物件判定（对照图 `{objs.get('sheet')}`，逐个编号判断「哪根是哪根」）"
-                         "。判断有误可以直接改 config：把该物件的 `output` 改成 "
-                         "`line`/`points`，或把 `is_data` 改成 true，再跑一次 extract:")
-            for d in objs["decisions"]:
-                mark = "✅ 提取" if (d.get("is_data") and str(d.get("output")).lower() != "skip") \
-                    else "⏭️ 跳过"
-                lines.append(f"  - #{d.get('id')} {mark} ｜ {d.get('what')} ｜ "
-                             f"归属={d.get('belongs_to') or '（无对应图例条目）'} ｜ "
-                             f"输出={d.get('output')}")
-                if d.get("reason"):
-                    lines.append(f"    - 依据: {d['reason']}")
+        spec = p.get("series_spec")
+        if spec:
+            lines.append("- 模型指出的曲线（锚点只是种子，数值由代码从锚点追踪得出）:")
+            for s in spec:
+                lines.append(f"  - {s.get('label') or '(无图例条目)'} ｜ 颜色={s.get('color')} "
+                             f"｜ 线型={s.get('linestyle')} ｜ 标记={s.get('has_markers')} "
+                             f"｜ 输出={s.get('output')} ｜ 锚点 {len(s.get('anchors') or [])} 个"
+                             + (f" ｜ {s['note']}" if s.get("note") else ""))
+        for ig in (p.get("ignore") or []):
+            lines.append(f"  - 忽略：{ig.get('what')}（{ig.get('why')}）")
         if results and p["id"] in results:
             r = results[p["id"]]
             lines.append(f"- 提取结果: {len(r['series'])} 条曲线")
@@ -960,16 +994,28 @@ def write_report(config, path, phase, results=None):
 
 
 def make_verify_image(panel_path, frame, axis, legend_colors, series_files, out_path,
-                      skipped=None):
+                      failed=None):
     """Thin wrapper so callers do not have to build the series tuples themselves."""
     series = []
     for csv_path, color_hex in zip(series_files, legend_colors):
         xs, ys = vo.read_csv(csv_path)
         series.append((Path(csv_path).stem, color_hex, xs, ys))
+    # 模型指出了但代码没追到的曲线：把它的锚点圈出来，肉眼即可判断是模型错还是代码错
+    marks = []
+    if failed:
+        img = iio.imread(panel_path)
+        if img is not None:
+            w, h = img.shape[1], img.shape[0]
+            for f in failed:
+                for a in (f.get("anchors") or []):
+                    try:
+                        x, y = float(a[0]) * w, float(a[1]) * h
+                    except (TypeError, ValueError, IndexError):
+                        continue
+                    marks.append(([int(x) - 10, int(y) - 10, int(x) + 10, int(y) + 10],
+                                  f"missed:{str(f.get('label'))[:12]}"))
     vo.compose_overlay(panel_path, frame, tuple(axis["x"]), tuple(axis["y"]),
-                       series, out_path,
-                       annotations=[(sk.get("bbox"), f"skip#{sk.get('object')}")
-                                    for sk in (skipped or []) if sk.get("bbox")])
+                       series, out_path, annotations=marks)
 
 
 def extract(cfg_path, force=False, only=None, vlm=None):
@@ -1071,11 +1117,10 @@ def extract(cfg_path, force=False, only=None, vlm=None):
         res["axis_range"] = rng
         results[p["id"]] = res
         log(f"{p['id']}: {len(res.get('series', []))} 条曲线"
-            + (f"  方式={'物件判定' if res.get('method') == 'objects' else '颜色追踪'}"
+            + (f"  方式={'锚点+追踪' if res.get('method') == 'seeded' else '颜色追踪'}"
                if res.get("series") else ""))
-        for sk in res.get("skipped_series") or []:
-            log(f"      ⏭ 跳过物件#{sk.get('object', '?')}（{str(sk.get('what'))[:36]}）："
-                f"{str(sk.get('reason'))[:60]}")
+        for f in res.get("failed") or []:
+            log(f"      ✗ 未追到：{str(f.get('label'))[:30]}（{str(f.get('reason'))[:60]}）")
         if res.get("series"):
             files = [csv_dir / s["file"] for s in res["series"]]
             colors = []
@@ -1087,7 +1132,7 @@ def extract(cfg_path, force=False, only=None, vlm=None):
                 colors.append(hexs or "#ff00ff")
             make_verify_image(panel_path, res["frame"], ax, colors, files,
                               verify_dir / f"{p['id']}_verify.png",
-                              skipped=res.get("skipped_series"))
+                              failed=res.get("failed"))
 
         # ---- VLM spot check: independent re-reading of a few points ----
         if vlm is not None and res.get("series"):
@@ -1159,10 +1204,10 @@ def extract(cfg_path, force=False, only=None, vlm=None):
 
 
 def _run_one(pdf, sub, row, dpi, pages, force, vlm, use_ocr, want=None, want_deep=False,
-             judge_objects=True):
+             find_series=True):
     """One PDF end-to-end (analyze + extract). Shared by serial and parallel batch."""
     cfg = analyze(pdf, sub, dpi=dpi, vlm=vlm, pages=pages, use_ocr=use_ocr, want=want,
-                  want_deep=want_deep, judge_objects=judge_objects)
+                  want_deep=want_deep, find_series=find_series)
     config = json.loads(Path(cfg).read_text(encoding="utf-8"))
     if config.get("selection"):
         row["matched"] = len(config["selection"].get("ids") or [])
@@ -1194,7 +1239,7 @@ def _log_row(row, with_vlm):
 
 
 def _batch_one(pdf_str, sub_str, dpi, pages, force, vlm_spec, use_ocr, want=None,
-               want_deep=False, judge_objects=True):
+               want_deep=False, find_series=True):
     """Worker body for --jobs > 1: one PDF per process.
 
     Output goes to that paper's own run.log - several processes printing to one terminal
@@ -1215,7 +1260,7 @@ def _batch_one(pdf_str, sub_str, dpi, pages, force, vlm_spec, use_ocr, want=None
                 client = None
         _LOG_FILE = (sub / "run.log").open("w", encoding="utf-8")
         _run_one(pdf, sub, row, dpi, pages, force, client, use_ocr, want, want_deep,
-                 judge_objects)
+                 find_series)
     except Exception as exc:  # noqa: BLE001
         row["error"] = f"{type(exc).__name__}: {exc}"
         log(f"  ✗ 失败: {row['error']}")
@@ -1232,7 +1277,7 @@ def _batch_one(pdf_str, sub_str, dpi, pages, force, vlm_spec, use_ocr, want=None
 
 
 def _batch_serial(pdfs, outdir, dpi, pages, force, vlm, use_ocr, want=None,
-                  want_deep=False, judge_objects=True):
+                  want_deep=False, find_series=True):
     rows = []
     for i, pdf in enumerate(pdfs, start=1):
         t_file = time.time()
@@ -1242,7 +1287,7 @@ def _batch_serial(pdfs, outdir, dpi, pages, force, vlm, use_ocr, want=None,
         row = new_row(pdf, sub)
         try:
             _run_one(pdf, sub, row, dpi, pages, force, vlm, use_ocr, want, want_deep,
-                     judge_objects)
+                     find_series)
         except Exception as exc:  # noqa: BLE001
             row["error"] = f"{type(exc).__name__}: {exc}"
             log(f"  ✗ 失败: {row['error']}")
@@ -1258,7 +1303,7 @@ def _batch_serial(pdfs, outdir, dpi, pages, force, vlm, use_ocr, want=None,
 
 
 def _batch_parallel(pdfs, outdir, jobs, dpi, pages, force, vlm, use_ocr, want=None,
-                    want_deep=False, judge_objects=True):
+                    want_deep=False, find_series=True):
     from concurrent.futures import ProcessPoolExecutor, as_completed
 
     spec = {"model": vlm.model, "base_url": vlm.base_url} if vlm is not None else None
@@ -1266,7 +1311,7 @@ def _batch_parallel(pdfs, outdir, jobs, dpi, pages, force, vlm, use_ocr, want=No
     with ProcessPoolExecutor(max_workers=jobs) as ex:
         futures = {ex.submit(_batch_one, str(pdf), str(outdir / pdf.stem), dpi, pages,
                              force, spec, use_ocr, want, want_deep,
-                             judge_objects): pdf for pdf in pdfs}
+                             find_series): pdf for pdf in pdfs}
         for fut in as_completed(futures):
             pdf = futures[fut]
             done += 1
@@ -1284,7 +1329,7 @@ def _batch_parallel(pdfs, outdir, jobs, dpi, pages, force, vlm, use_ocr, want=No
 
 def batch(dir_path, outdir, dpi=300, vlm=None, pages=None, force=False,
           pattern="*.pdf", recursive=False, use_ocr=True, jobs=1, want=None,
-          want_deep=False, judge_objects=True):
+          want_deep=False, find_series=True):
     """Process every PDF in a folder, then write a combined summary.
 
     jobs=1 keeps everything in one process (shared OCR engine / VLM client and caches).
@@ -1309,14 +1354,14 @@ def batch(dir_path, outdir, dpi=300, vlm=None, pages=None, force=False,
 
     if jobs > 1:
         rows = _batch_parallel(pdfs, outdir, jobs, dpi, pages, force, vlm, use_ocr, want,
-                               want_deep, judge_objects)
+                               want_deep, find_series)
         # 用量在子进程里累计，父进程按行加总后再打印
         if vlm is not None:
             for k in vlm.usage:
                 vlm.usage[k] = sum(r.get("usage", {}).get(k, 0) for r in rows)
     else:
         rows = _batch_serial(pdfs, outdir, dpi, pages, force, vlm, use_ocr, want,
-                             want_deep, judge_objects)
+                             want_deep, find_series)
 
     md = ["# 批量提取汇总", "",
           f"- 来源目录: `{src}`", f"- 处理文件: {len(pdfs)} 个", ""]
@@ -1409,8 +1454,8 @@ def main():
                    help="用一句话说要哪些图，如 --want \"800 bar 下速度随时间的折线图\"")
     a.add_argument("--want-deep", action="store_true",
                    help="再用正文里提到图的段落判定一次（更准，每篇约 ¥0.02）")
-    a.add_argument("--no-object-judge", action="store_true",
-                   help="跳过物件级判定（省掉每面板一次调用，但就分不清哪根线是数据）")
+    a.add_argument("--no-find-series", action="store_true",
+                   help="不让模型找曲线（省掉每面板一次调用，但就不知道该提哪几条线）")
 
     e = sub.add_parser("extract", help="按配置提取数据（只跑已确认的面板）")
     e.add_argument("config")
@@ -1440,7 +1485,7 @@ def main():
     al.add_argument("--ocr", action="store_true", help="即使启用 VLM 也跑 OCR 交叉核对")
     al.add_argument("--want", default=None, help="用一句话说要哪些图（见 README）")
     al.add_argument("--want-deep", action="store_true", help="再用正文段落判定一次")
-    al.add_argument("--no-object-judge", action="store_true", help="跳过物件级判定")
+    al.add_argument("--no-find-series", action="store_true", help="不让模型找曲线")
 
     b = sub.add_parser("batch", help="批量处理一个目录下的所有 PDF，并输出汇总")
     b.add_argument("dir")
@@ -1460,7 +1505,7 @@ def main():
     b.add_argument("--want", default=None,
                    help="用一句话说要哪些图；每篇都按同一句需求筛")
     b.add_argument("--want-deep", action="store_true", help="再用正文段落判定一次")
-    b.add_argument("--no-object-judge", action="store_true", help="跳过物件级判定")
+    b.add_argument("--no-find-series", action="store_true", help="不让模型找曲线")
 
     sub.add_parser("doctor", help="环境自检：解释器、依赖、API key")
 
@@ -1497,7 +1542,7 @@ def main():
     if args.cmd == "analyze":
         analyze(args.pdf, args.out, args.dpi, vlm=make_vlm(), pages=args.pages,
                 use_ocr=use_ocr(), want=args.want, want_deep=args.want_deep,
-                judge_objects=not args.no_object_judge)
+                find_series=not args.no_find_series)
     elif args.cmd == "extract":
         extract(args.config, force=args.force,
                 only=set(args.only) if args.only else None, vlm=make_vlm())
@@ -1507,7 +1552,7 @@ def main():
         client = make_vlm()
         cfg = analyze(args.pdf, args.out, args.dpi, vlm=client, pages=args.pages,
                       use_ocr=use_ocr(), want=args.want, want_deep=args.want_deep,
-                      judge_objects=not args.no_object_judge)
+                      find_series=not args.no_find_series)
         extract(cfg, force=args.force, vlm=client)
         if client is not None:
             print_vlm_usage(client, "本次合计")
@@ -1515,7 +1560,7 @@ def main():
         batch(args.dir, args.out, dpi=args.dpi, vlm=make_vlm(), pages=args.pages,
               force=args.force, pattern=args.pattern, recursive=args.recursive,
               use_ocr=use_ocr(), jobs=args.jobs, want=args.want,
-              want_deep=args.want_deep, judge_objects=not args.no_object_judge)
+              want_deep=args.want_deep, find_series=not args.no_find_series)
     elif args.cmd == "doctor":
         doctor()
 

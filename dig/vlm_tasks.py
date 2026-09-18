@@ -208,39 +208,43 @@ def select_figures_by_body(vlm, want, index_text, body_text):
     return data
 
 
-OBJECT_SYSTEM = "你是科研论文图表的读图助手，只输出 json。"
+FIND_SERIES_SYSTEM = "你是科研论文图表的读图助手，只输出 json。"
 
-OBJECT_PROMPT = """这张论文插图的绘图区里，我检测出 {n} 个候选物件。
-左边是原图（每个候选物件用红框标出并编号），右边是把每个物件单独放大的对照图（编号在左上角）。
-图例里读到的条目：{legend}
-每个物件的客观信息（代码量的，供你参考）：
-{objects}
-
-请逐个判断它们分别是什么，只输出 json：
-{{"objects": [{{"id": 1, "what": "蓝色虚线，带三角标记", "is_data": true,
-  "belongs_to": "Normaltip", "output": "line",
-  "reason": "图例里 Normaltip 就是蓝色虚线"}}], "notes": ""}}
+# 让模型**自己找出**数据曲线，而不是评价代码给出的候选清单。这样它的输出是一份
+# "要点提取的曲线"清单（正向），不会出现"数据被判成非数据而消失"的情况；漏了哪条
+# 也只是报告里对账得到，不会静默丢。
+FIND_SERIES_PROMPT = """这是一张论文插图。请找出图里**所有需要提取数据的曲线**，并给出每条曲线的大致位置。
+图例里读到的条目（供参考，可能不全）：{legend}
+只输出 json：
+{{"series": [
+  {{"label": "Normaltip", "y_axis": "left", "color": "#1816c0", "linestyle": "dashed",
+    "has_markers": true, "output": "line", "anchors": [[0.06, 0.02], [0.5, 0.55], [0.95, 0.78]],
+    "note": "两条曲线在前半段几乎重合"}}],
+ "ignore": [{{"what": "蓝色实线，旁边写着 S ∝ t^0.5", "why": "作者的斜率参考线，不是数据"}}]}}
 字段要求：
-- what：一句话客观描述这个物件（颜色 + 线型 + 有没有标记符号 + 旁边有没有文字）
-- is_data：它是不是**用户要提取的数据**。作者画的斜率参考线（如旁边写着 S ∝ t^0.5）、拟合线、
-  示意线、坐标辅助线、纯文字/箭头标注 → false
-- belongs_to：对应图例里的哪个条目；**对不上任何条目就填 null**
-- output：points（这一系列要"标记点的坐标"）/ line（要"线的轨迹"）/
-  both（点和线都要，分成两个产物）/ skip（不提取）
-- reason：一句话依据。**判 false 或 skip 时一定要写清理由**（例如"图例只有 Heatedtip 与 Normaltip
-  两个条目，这个物件没有对应条目，是作者的斜率分析线"）
-注意：
-- 同一根线被拆成几个编号时，只有最长的那段填 output，其余填 skip 并写明"是 #N 的一段"
-- 图例条目是"标记符号"（如 ▽）的多半要 points；图例条目是"线型"（如 —·—）的多半要 line
-- 不确定就填 skip，并在 reason 里说明，不要猜"""
+- label：这条曲线对应图例里的哪个条目；图例里没有就填 null 并在 note 说明
+- y_axis：读的是左轴还是右轴（只有一个纵轴时填 left）
+- color：这条线**实际**的颜色，十六进制；看不清就填 null
+- linestyle：solid|dashed|dashdot|marker|band
+- has_markers：曲线上有没有标记符号（三角/方块/圆点）
+- **output**：points（只要标记点的坐标）/ line（只要线的轨迹）/ both（点和线都要）
+  * 图例条目画的是标记符号、或说明里写"实验/测量"的 → points
+  * 是模型/拟合曲线（如 model、correlation、计算值）→ line
+  * 两者都有（实验点 + 拟合线画在一起）→ both
+- **anchors**：这条曲线上三个点的**大致**位置，按 [x, y] 给，
+  x、y 都是相对图片的归一化坐标（左上角 0,0，右下角 1,1），顺序为
+  "从左数第一个可见点、中间一点、最右端一点"。**不要求精确**（±3% 就够），
+  代码会以它们为种子去精确追踪。曲线被遮挡或断裂时，挑你确实看得见的位置。
+- note：一句话说明（例如"与另一条曲线重叠"、"前半段被图例遮住"）
+另外用 ignore 列出你**没有**当作数据的东西（作者画的斜率参考线、拟合辅助线、示意图、
+标注文字等），各写一句理由。
+注意：坐标轴、网格、图例框、纯标注文字都不是数据曲线。"""
 
 
-def judge_objects(vlm, sheet_path, legend_text, objects_text):
-    """Ask the model what each detected object is, and what to do with it."""
-    n = objects_text.count("\n") + 1 if objects_text.strip() else 0
-    prompt = OBJECT_PROMPT.format(n=n, legend=legend_text or "（没读到图例）",
-                                  objects=objects_text or "（无）")
-    data, raw = vlm.ask_json(sheet_path, prompt, system=OBJECT_SYSTEM, retries=2,
+def find_series(vlm, image_path, legend_text):
+    """Ask the model where the data curves are (coarse seeds), not what our blobs are."""
+    prompt = FIND_SERIES_PROMPT.format(legend=legend_text or "（没读到图例）")
+    data, raw = vlm.ask_json(image_path, prompt, system=FIND_SERIES_SYSTEM, retries=2,
                              max_tokens=1600)
     data["_raw"] = raw
     return data

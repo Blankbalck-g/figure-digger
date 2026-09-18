@@ -99,21 +99,26 @@ def _family(comp):
     return f"h{int(comp['hue'] // 30)}"
 
 
-def _cluster_along_x(comps, max_dx_frac=2.2, max_dy=60.0, slope=1.2):
+def _cluster_along_x(comps, min_dx_frac=0.4, max_dx_frac=2.2, max_dy=30.0, slope=0.9):
     """Chain markers that lie along the same curve.
 
     Plain proximity clustering fails on these figures: markers of one series sit
-    ~90px apart while the two curves of the figure are only ~150px apart, so a radius
-    big enough to chain the series also swallows the neighbouring curve (measured
-    radius=70 gave pairs, radius=130 started merging curves). Linking only markers
-    whose x gap and y step are both plausible follows the curve instead.
+    ~60px apart along x, while the two curves of the figure have pairs of markers
+    stacked 18-40px apart at the *same* x. A radius big enough to chain a series
+    therefore swallows the neighbouring curve (measured: radius=70 gave pairs,
+    radius=130 merged the curves).
+
+    So a link needs both: a real horizontal step (>= 0.4 x the median spacing) and a
+    plausible rise. Vertically stacked markers at the same x - the other curve's -
+    fail the first test.
     """
     if not comps:
         return []
-    xs = sorted(c["cx"] for c in comps)
+    xs = sorted({round(c["cx"], 1) for c in comps})     # 去重：同 x 的成对标记不算间距
     gaps = [b - a for a, b in zip(xs, xs[1:])]
     median_dx = float(np.median(gaps)) if gaps else 0.0
     limit_dx = max(20.0, max_dx_frac * median_dx)
+    need_dx = min_dx_frac * median_dx
     n = len(comps)
     parent = list(range(n))
 
@@ -126,7 +131,7 @@ def _cluster_along_x(comps, max_dx_frac=2.2, max_dy=60.0, slope=1.2):
     for i in range(n):
         for j in range(i + 1, n):
             dx = abs(comps[i]["cx"] - comps[j]["cx"])
-            if dx > limit_dx:
+            if dx > limit_dx or dx < need_dx:
                 continue
             dy = abs(comps[i]["cy"] - comps[j]["cy"])
             if dy <= max(max_dy, slope * dx):
@@ -148,6 +153,61 @@ def _varies_along_curve(members):
     ys = [c["cy"] for c in members]
     heights = [c["h"] for c in members]
     return (max(ys) - min(ys)) >= 3.0 * max(1.0, float(np.median(heights)))
+
+
+def _chain_markers(points, max_step_frac=3.0, min_tol=25.0, tol_frac=0.6):
+    """Group marker centres into curves by *following* them, one curve at a time.
+
+    Symmetric "are these two linked" rules fail here: when two curves run close, a
+    marker of one curve sits within the vertical tolerance of the other curve's next
+    marker, and the whole panel collapses into a single chain (measured on
+    2014-01-1413 p14: 14 markers of two curves merged into one series). Following a
+    chain with a predicted position - the same trick the line tracer uses - keeps the
+    two curves apart, because the step to the other curve never matches the predicted
+    rise.
+    """
+    pts = sorted((float(x), float(y)) for x, y in points)
+    if not pts:
+        return []
+    xs = sorted({round(x, 1) for x, _ in pts})
+    gaps = [b - a for a, b in zip(xs, xs[1:])]
+    median_dx = float(np.median(gaps)) if gaps else 0.0
+    max_step = max(25.0, max_step_frac * median_dx)
+    groups = []
+    left = list(pts)
+    while left:
+        cur = left.pop(0)
+        chain = [cur]
+        slope = 0.0
+        while True:
+            best = None
+            for k, (x, y) in enumerate(left):
+                dx = x - cur[0]
+                if dx <= 0 or dx > max_step:
+                    continue
+                tol = max(min_tol, tol_frac * dx)
+                d = abs(y - (cur[1] + slope * dx))
+                if d <= tol and (best is None or d < best[0]):
+                    best = (d, k, x, y)
+            if best is None:
+                break
+            _, k, x, y = best
+            slope = max(-2.0, min(2.0, (y - cur[1]) / max(1e-6, x - cur[0])))
+            cur = (x, y)
+            chain.append(cur)
+            left.pop(k)
+        groups.append(chain)
+    return groups
+
+
+def _line_y_at(trace, x, reach=12.0):
+    """y of the traced line at this x (nearest traced column within `reach`)."""
+    best = None
+    for tx, ty in trace:
+        d = abs(tx - x)
+        if d <= reach and (best is None or d < best[0]):
+            best = (d, ty)
+    return best[1] if best else None
 
 
 def _drop_fragments(objects, tol=8.0, need=0.75):
@@ -273,6 +333,7 @@ def detect_objects(img, frame, exclude_boxes=(), max_objects=MAX_OBJECTS):
         fam_mask[fam] = m
 
     objects = []
+    texts = []                  # 标记分组的落选者，最后和文字块一起处理
     for fam, m in fam_mask.items():
         if int((m > 0).sum()) < 120:
             continue
@@ -297,40 +358,6 @@ def detect_objects(img, frame, exclude_boxes=(), max_objects=MAX_OBJECTS):
                          "label": i, "color": (0, 0, 0), "hue": 0, "sat": 0,
                          "thickness": area / max(1.0, float(max(w, h)))})
             marker_px[ys, xs] = 255
-        marker_px = cv2.dilate(marker_px, np.ones((k + 2, k + 2), np.uint8))
-
-        # 标记系列：同尺寸、沿曲线成串、纵向有起伏
-        classes = []
-        for c in sorted(cand, key=lambda c: c["area"]):
-            for cl in classes:
-                a, b = cl[-1]["area"], c["area"]
-                if max(a, b) <= 1.8 * max(1, min(a, b)):
-                    cl.append(c)
-                    break
-            else:
-                classes.append([c])
-        for cl in classes:
-            for members in _cluster_along_x(cl):
-                if len(members) >= MIN_MARKERS and _varies_along_curve(members):
-                    xs = [c["cx"] for c in members]
-                    if (max(xs) - min(xs)) < 0.2 * (right - left):
-                        continue
-                    px = np.zeros(mask.shape[:2], np.uint8)
-                    for c in members:
-                        px[c["y"]:c["y"] + c["h"], c["x"]:c["x"] + c["w"]] = 255
-                    col = tuple(int(v) for v in np.median(img[px > 0], axis=0))
-                    objects.append({
-                        "kind": "markers", "family": fam, "hex": _hex(col),
-                        "color_bgr": col, "hue": _hue(col),
-                        "n_markers": len(members),
-                        "pixels": px,
-                        "centroids": [(c["cx"], c["cy"]) for c in members],
-                        "bbox": [int(min(c["x"] for c in members)),
-                                 int(min(c["y"] for c in members)),
-                                 int(max(c["x"] + c["w"] for c in members)),
-                                 int(max(c["y"] + c["h"] for c in members))],
-                    })
-
         # 线：把标记的像素减掉，剩下的细笔画交给连续性追踪器（它自己跨虚线断口）
         line_mask = cv2.bitwise_and(m, cv2.bitwise_not(marker_px))
         if int((line_mask > 0).sum()) >= 80:
@@ -346,6 +373,64 @@ def detect_objects(img, frame, exclude_boxes=(), max_objects=MAX_OBJECTS):
                     "kind": "line", "family": fam, "hex": _hex(col), "color_bgr": col,
                     "hue": _hue(col), "nx": len(pts), "trace": pts,
                     "bbox": [int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys))],
+                })
+
+        marker_px = cv2.dilate(marker_px, np.ones((k + 2, k + 2), np.uint8))
+
+        # 标记系列：同尺寸、沿曲线成串、纵向有起伏
+        classes = []
+        for c in sorted(cand, key=lambda c: c["area"]):
+            for cl in classes:
+                a, b = cl[-1]["area"], c["area"]
+                if max(a, b) <= 1.8 * max(1, min(a, b)):
+                    cl.append(c)
+                    break
+            else:
+                classes.append([c])
+        # 分组用"挂在哪条线上"：同一根线上的标记才是一系列。纯几何串接在两条曲线靠近时
+        # 会连错（实测两条红虚线的标记被并成一组：上曲线在 x=281 的点与下曲线在 x=342
+        # 的点纵向只差 16px），而"离哪条线最近"对这几个图是稳的。
+        fam_traces = [(o.get("id", id(o)), o["trace"]) for o in objects
+                      if o["kind"] == "line" and o["family"] == fam and o.get("trace")]
+        for cl in classes:
+            if len(cl) < MIN_MARKERS:
+                continue
+            buckets = {}
+            for c in cl:
+                host = None
+                for key, trace in fam_traces:
+                    yl = _line_y_at(trace, c["cx"])
+                    if yl is None:
+                        continue
+                    d = abs(yl - c["cy"])
+                    if d <= 20 and (host is None or d < host[0]):
+                        host = (d, key)
+                buckets.setdefault(host[1] if host else None, []).append(c)
+            for key, members in buckets.items():
+                members.sort(key=lambda c: c["cx"])
+                if len(members) < MIN_MARKERS:
+                    texts.extend(members)
+                    continue
+                if not _varies_along_curve(members):
+                    texts.extend(members)     # 同一水平线上的一串 = 文字
+                    continue
+                xs = [c["cx"] for c in members]
+                if (max(xs) - min(xs)) < 0.2 * (right - left):
+                    texts.extend(members)
+                    continue
+                px = np.zeros(mask.shape[:2], np.uint8)
+                for c in members:
+                    px[c["y"]:c["y"] + c["h"], c["x"]:c["x"] + c["w"]] = 255
+                col = tuple(int(v) for v in np.median(img[px > 0], axis=0))
+                objects.append({
+                    "kind": "markers", "family": fam, "hex": _hex(col),
+                    "color_bgr": col, "hue": _hue(col),
+                    "n_markers": len(members), "pixels": px, "on_line": key,
+                    "centroids": [(c["cx"], c["cy"]) for c in members],
+                    "bbox": [int(min(c["x"] for c in members)),
+                             int(min(c["y"] for c in members)),
+                             int(max(c["x"] + c["w"] for c in members)),
+                             int(max(c["y"] + c["h"] for c in members))],
                 })
 
     # 已被"标记系列/线"认领的像素减掉，剩下的才是标注文字；再把碎字聚成几块，
@@ -379,6 +464,11 @@ def detect_objects(img, frame, exclude_boxes=(), max_objects=MAX_OBJECTS):
                                 -(o.get("n_markers") or 0)))
     for i, o in enumerate(objects[:max_objects], start=1):
         o["id"] = i
+    # on_line 里存的是运行期 id，换成最终编号，模型才好引用（"挂在 #5 上"）
+    idmap = {id(o): o.get("id") for o in objects[:max_objects]}
+    for o in objects[:max_objects]:
+        if o.get("on_line") in idmap:
+            o["on_line"] = idmap[o["on_line"]]
     return objects[:max_objects]
 
 
@@ -391,7 +481,9 @@ def describe(obj, frame):
     if obj["kind"] == "line":
         return f"线状物件（{obj['nx']} 像素，{pos}），颜色 {obj['hex']}"
     if obj["kind"] == "markers":
-        return f"{obj['n_markers']} 个同色同尺寸的标记符号（{pos}），颜色 {obj['hex']}"
+        on_line = f"，挂在线 #{obj['on_line']} 上" if obj.get("on_line") else "，附近没有同色的线"
+        return (f"{obj['n_markers']} 个同色同尺寸的标记符号（{pos}），"
+                f"颜色 {obj['hex']}{on_line}")
     if obj["kind"] == "text":
         return f"文字/标注块（{obj['nx']} 像素，{pos}），颜色 {obj['hex']}"
     return f"大面积色块（{obj['nx']} 像素，{pos}），颜色 {obj['hex']}，疑似误差带/底纹"

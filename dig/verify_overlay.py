@@ -102,12 +102,14 @@ def draw_plot(canvas, box, series, xr, yr, xlabel, ylabel):
 
 
 def compose_overlay(image_path, frame, xrange, yrange, series, out_path,
-                    xlabel="x", ylabel="y"):
+                    xlabel="x", ylabel="y", annotations=None):
     """Build the two-panel QA image: left = points reprojected on the figure,
     right = the extracted data replotted.
 
     `series` is a list of (label, colour, xs, ys); colour may be a name, #rrggbb or a BGR
-    tuple. This is the single implementation used by both the CLI and run.py.
+    tuple. `annotations` is a list of (bbox, label) drawn as dashed grey boxes - used for
+    the objects the model judged "not data", so a wrong verdict is visible at a glance.
+    This is the single implementation used by both the CLI and run.py.
     """
     left, top, right, bottom = frame
     xmin, xmax = xrange
@@ -127,6 +129,15 @@ def compose_overlay(image_path, frame, xrange, yrange, series, out_path,
             px = int(round(left + (x - xmin) / (xmax - xmin) * (right - left)))
             py = int(round(bottom - (y - ymin) / (ymax - ymin) * (bottom - top)))
             cv2.circle(img, (px, py), 1, (255, 0, 255), -1)
+
+    for item in (annotations or []):
+        bbox, label = item if isinstance(item, tuple) else (item["bbox"], item.get("what"))
+        if not bbox:
+            continue
+        x0, y0, x1, y1 = [int(v) for v in bbox]
+        cv2.rectangle(img, (x0, y0), (x1, y1), (150, 150, 150), 1, cv2.LINE_AA)
+        cv2.putText(img, str(label)[:18], (x0 + 2, max(12, y0 - 3)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (120, 120, 120), 1, cv2.LINE_AA)
 
     panel_w = 900
     h, w = img.shape[:2]

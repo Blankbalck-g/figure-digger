@@ -942,14 +942,17 @@ def write_report(config, path, phase, results=None):
     Path(path).write_text("\n".join(lines), encoding="utf-8")
 
 
-def make_verify_image(panel_path, frame, axis, legend_colors, series_files, out_path):
+def make_verify_image(panel_path, frame, axis, legend_colors, series_files, out_path,
+                      skipped=None):
     """Thin wrapper so callers do not have to build the series tuples themselves."""
     series = []
     for csv_path, color_hex in zip(series_files, legend_colors):
         xs, ys = vo.read_csv(csv_path)
         series.append((Path(csv_path).stem, color_hex, xs, ys))
     vo.compose_overlay(panel_path, frame, tuple(axis["x"]), tuple(axis["y"]),
-                       series, out_path)
+                       series, out_path,
+                       annotations=[(sk.get("bbox"), f"skip#{sk.get('object')}")
+                                    for sk in (skipped or []) if sk.get("bbox")])
 
 
 def extract(cfg_path, force=False, only=None, vlm=None):
@@ -1066,7 +1069,8 @@ def extract(cfg_path, force=False, only=None, vlm=None):
                         s["target_bgr"][2], s["target_bgr"][1], s["target_bgr"][0])
                 colors.append(hexs or "#ff00ff")
             make_verify_image(panel_path, res["frame"], ax, colors, files,
-                              verify_dir / f"{p['id']}_verify.png")
+                              verify_dir / f"{p['id']}_verify.png",
+                              skipped=res.get("skipped_series"))
 
         # ---- VLM spot check: independent re-reading of a few points ----
         if vlm is not None and res.get("series"):

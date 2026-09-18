@@ -319,6 +319,7 @@ def process_objects(image_path, frame, objects, decisions, rng, outdir):
         label = d.get("belongs_to") or d.get("what") or f"obj{o['id']}"
         if d.get("is_data") is False or want == "skip":
             skipped.append({"object": o.get("id"), "kind": o["kind"], "what": d.get("what"),
+                            "bbox": o.get("bbox"),
                             "reason": d.get("reason") or "模型判定不是数据"})
             continue
         pts = []
@@ -329,6 +330,7 @@ def process_objects(image_path, frame, objects, decisions, rng, outdir):
         data = el.to_data(pts, frame, xmin, xmax, ymin, ymax) if pts else []
         if len(data) < 5:
             skipped.append({"object": o.get("id"), "kind": o["kind"], "what": d.get("what"),
+                            "bbox": o.get("bbox"),
                             "reason": f"判为要提取，但可用点只有 {len(data)} 个"})
             continue
         name = _unique_path(outdir, f"{image_path.stem}_{_safe_tag(label)}.csv")

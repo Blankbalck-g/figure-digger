@@ -258,19 +258,41 @@ def _trace_score(pts, frame_w):
     return span * 1000.0 - rough * 8.0
 
 
+def _drop_short_excursions(pts, resid, thr, max_run=3):
+    """只丢"很短的一段偏离"，长段偏离是真形状（尖峰/陡升），必须留。
+
+    老写法是逐点判断"离邻居中位数太远就删"：窄尖峰（燃烧压力那种，十几个像素
+    宽、上百像素高）的每个点都离邻居很远，于是整个峰被削平——实测 2026-01-0340
+    图 14 的红色尖峰被读成 4.5，真值是 5.5。改成按连续长度判断：文字/箭头误抓
+    只跳一两个点，真尖峰是连续几十个点。
+    """
+    keep, i, n = [], 0, len(pts)
+    while i < n:
+        if abs(resid[i]) <= thr:
+            keep.append(pts[i])
+            i += 1
+            continue
+        j = i
+        while j < n and abs(resid[j]) > thr:
+            j += 1
+        if j - i > max_run:
+            keep.extend(pts[i:j])
+        i = j
+    return keep
+
+
 def _despeckle(pts, max_dev=25.0, window=2):
     """Drop single-column outliers (arrow tips, glyphs crossing the line)."""
     if len(pts) < 5:
         return pts
     ys = np.array([p[1] for p in pts], dtype=float)
-    keep = []
-    for i, (x, y) in enumerate(pts):
+    resid = np.zeros(len(pts), dtype=float)
+    for i in range(len(pts)):
         lo, hi = max(0, i - window), min(len(pts), i + window + 1)
         neigh = np.delete(ys[lo:hi], i - lo)
-        if neigh.size and abs(y - np.median(neigh)) > max_dev:
-            continue
-        keep.append((x, y))
-    return keep
+        resid[i] = ys[i] - np.median(neigh) if neigh.size else 0.0
+    keep = _drop_short_excursions(pts, resid, max_dev, max_run=3)
+    return keep if len(keep) >= 5 else pts
 
 
 def _running_median(values, win):
@@ -299,7 +321,7 @@ def _smooth_despike(pts, win=25, min_dev=9.0, mad_k=4.0):
     resid = ys - base
     mad = float(np.median(np.abs(resid - np.median(resid))))
     thr = max(min_dev, mad_k * mad)
-    keep = [(x, y) for (x, y), r in zip(pts, resid) if abs(r) <= thr]
+    keep = _drop_short_excursions(pts, resid, thr, max_run=5)
     return keep if len(keep) >= 8 else pts
 
 
@@ -404,15 +426,31 @@ def trace_series_instances(hsv, frame, target_bgr, hue_tol=14, sat_frac=0.45,
 
 def color_mask(hsv, frame, target_bgr, hue_tol=14, sat_frac=0.45, min_sat=45,
                val_frac=0.25, exclude_boxes=()):
-    """Pixels belonging to a legend colour, clipped to the plot area."""
+    """Pixels belonging to a legend colour, clipped to the plot area.
+
+    `exclude_boxes` 里可以混着两类：4 元组 (x, y, w, h) 一律清掉；5 元组
+    (x, y, w, h, "#rrggbb") 是图例色块窄带，只对**同色**曲线生效（图例框常压在
+    数据曲线上，一条红线穿过蓝色图例条时不该被切断）。
+    """
     th, ts, tv = bgr_to_hsv(target_bgr)
+    boxes = []
+    for b in exclude_boxes or ():
+        if len(b) >= 5:
+            try:
+                bh = bgr_to_hsv(hex_to_bgr(str(b[4])))[0]
+            except Exception:  # noqa: BLE001
+                continue
+            dh = abs(th - bh)
+            if min(dh, 180 - dh) > max(hue_tol, 12):
+                continue
+        boxes.append(tuple(b[:4]))
     hue = hsv[:, :, 0].astype(int)
     sat = hsv[:, :, 1].astype(int)
     val = hsv[:, :, 2].astype(int)
     dh = np.abs(hue - th)
     dh = np.minimum(dh, 180 - dh)
     mask = ((dh <= hue_tol) & (sat >= max(min_sat, sat_frac * ts)) & (val >= val_frac * tv))
-    return _clip_and_mask(mask.astype(np.uint8) * 255, frame, exclude_boxes)
+    return _clip_and_mask(mask.astype(np.uint8) * 255, frame, boxes)
 
 
 def trace_hue_instances(hsv, frame, hue_center, hue_tol=14, sat_min=70, val_min=40,
@@ -495,7 +533,13 @@ def _clip_and_mask(mask, frame, exclude_boxes):
     mask[:, :left + 2] = 0
     mask[:, right:] = 0
     fw, fh = max(1, right - left), max(1, bottom - top)
-    for (x, y, w, h) in exclude_boxes:
+    for box in exclude_boxes:
+        x, y, w, h = (int(v) for v in box[:4])
+        if h <= 20:
+            # 图例色块的窄带（见 batch_extract.legend_boxes）：只清这一条。图例框
+            # 常常压在数据曲线上，把整框连"框外一圈小碎块"一起清掉会抹掉真实数据。
+            mask[max(0, y - 2):y + h + 2, max(0, x - 2):x + w + 2] = 0
+            continue
         mask[max(0, y - 3):y + h + 3, max(0, x - 3):x + w + 3] = 0
         # 图例框 / 放大子图的**刻度文字**常画在框外一圈（inset 的 70/60/50 就标在
         # 框左边约 40px 处），只清框内救不了它们。所以再清掉框周围一圈里的

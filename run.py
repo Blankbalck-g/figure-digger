@@ -113,7 +113,10 @@ def split_figure(figure_path, outdir, margin=None):
     img = iio.imread(figure_path)
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     h, w = gray.shape
-    boxes = sp.order_row_major(sp.find_panel_boxes(gray))
+    # 轮廓框 + L 形坐标轴框：只画了左轴/下轴的子图（很常见）没有闭合轮廓，
+    # 单靠轮廓法会退回"曲线围出的空洞"，把整幅子图的数据丢掉。
+    boxes = sp.order_row_major(sp.merge_panel_boxes(sp.find_panel_boxes(gray),
+                                                    sp.find_spine_boxes(gray)))
     if not boxes:
         # 一个绘图框都没检出：整图当一个面板处理。丢弃才是更糟的选择——
         # 位图路线后面还有"非数据图"门限会把它拦下，静默丢图则连机会都没有。
@@ -270,37 +273,104 @@ def _extract_panel(panel, panel_path, rng, csv_dir):
 
 
 def _extract_seeded(panel, panel_path, rng, csv_dir, spec):
-    """按"模型锚点 → 代码追踪"提取；返回 None 表示这条路线不可用（回退）。"""
+    """按"颜色优先 + 锚点消歧 → 代码追踪"提取；返回 None 表示这条路线不可用（回退）。
+
+    颜色是主键（图例色块 > 锚点实测 > 模型给的十六进制），锚点只在同色多实例时
+    参与排序。原因见 series_seed 的模块说明：模型的锚点经常偏几十到几百像素，
+    拿它当取色点会取到白底，进而把几条不同颜色的线追成同一条轨迹。
+    """
     import series_seed as ss
     img = iio.imread(panel_path)
     if img is None:
         return None
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     frame = be._frame_of(gray, panel.get("frame"))
-    exclude = be.inner_boxes(gray, frame)
+    exclude = be.inner_boxes(gray, frame, img=img)
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
     xmin, xmax, ymin, ymax = rng
+    palette = list(panel.get("legend_colors") or []) + \
+        list((panel.get("series_names") or {}).keys())
     series, failed = [], []
+    used_keys, accepted = set(), []
+    # 先给每条曲线定颜色，再按"颜色之间离得多远"给每条独立的色相容差：橙和金
+    # 只差 12 个色相时，统一的容差会让两条线互相串色（实测 E30 因此追成了 E00）。
+    resolved = []
     for s in spec:
-        anchors = ss.anchors_to_pixels(s.get("anchors"), frame, (img.shape[1], img.shape[0]))
-        if not anchors:
-            failed.append({"label": s.get("label"), "reason": "模型没给出可用的锚点坐标"})
-            continue
-        color = ss.sample_color(img, anchors)
-        if color is None and s.get("color"):
-            try:
-                color = tuple(el.hex_to_bgr(s["color"]))
-            except Exception:  # noqa: BLE001
-                color = None
+        anchors = ss.anchors_to_pixels(s.get("anchors"), frame,
+                                       (img.shape[1], img.shape[0]))
+        color, how = ss.resolve_color(img, anchors, s.get("color"), palette)
+        resolved.append((s, anchors, color, how))
+    tols = ss.hue_tolerances([c for _s, _a, c, _h in resolved])
+    # ---- 第一遍：每条曲线按自己的颜色精确追踪 ----
+    picks = []
+    for (s, anchors, color, how), hue_tol in zip(resolved, tols):
         if color is None:
-            failed.append({"label": s.get("label"), "reason": "锚点附近取不到颜色"})
+            failed.append({"label": s.get("label"), "anchors": s.get("anchors"),
+                           "reason": "颜色定不下来（模型没给颜色、锚点也没落在线上、图例里也没有）"})
             continue
-        trace, info = ss.trace_best(img, hsv, frame, anchors, color, exclude)
-        if len(trace) < 20 or (info.get("coverage") or 0) < 0.12:
-            failed.append({"label": s.get("label"),
-                           "reason": f"从锚点追踪失败（种子命中 {info.get('seeded')}/{len(anchors)} 个锚点）",
-                           "anchors": s.get("anchors")})
+        trace, kind, info = ss.trace_series(hsv, frame, color, anchors, exclude,
+                                            hue_tol=hue_tol, avoid=used_keys)
+        info["hue_tol"] = hue_tol
+        span = ((max(p[0] for p in trace) - min(p[0] for p in trace))
+                / max(1.0, frame[2] - frame[0])) if trace else 0.0
+        # 太短的先留着：它可能正是"大半段被压在另一条线下面"的那条，补全后再定去留。
+        picks.append({"s": s, "anchors": anchors, "color": color, "how": how,
+                      "hue_tol": hue_tol, "trace": trace, "kind": kind, "info": info,
+                      "span": span, "completion": {}})
+
+    # ---- 第二遍：遮挡补全（"重合部分颜色只显示一个"）----
+    # 两条线画在一起时，压在下面的那条在重合段里一个像素都没有：不是追踪失败，是
+    # 图上没有东西可追。这里拿"另一条线真的画在那里"当证据，把断掉的那几段沿它补
+    # 回来；没有证据的长断口一律不补（曲线真到头了的情况必须保持原样）。
+    names = {i: str(p["s"].get("label") or f"series{i + 1}")
+             for i, p in enumerate(picks)}
+    occl = {i: ss.dense_trace(p["trace"]) for i, p in enumerate(picks)
+            if p["kind"] != "loop" and p["trace"]}
+    for idx, p in sorted(enumerate(picks), key=lambda t: -len(t[1]["trace"])):
+        if p["kind"] == "loop":
+            # 闭合回线的补全要先把散成十几块的弧串起来（见 series_seed 说明），
+            # 这一版还没做，先不在这里假装补上。
             continue
+        others = [(names[j], d) for j, d in occl.items() if j != idx]
+        if not others:
+            continue
+        mask = el.color_mask(hsv, frame, p["color"], p["hue_tol"], exclude_boxes=exclude)
+        filled, cinfo = ss.complete_trace(p["trace"], mask, frame, others)
+        if filled and len(filled) > len(p["trace"]):
+            p["raw_trace"], p["trace"], p["completion"] = p["trace"], filled, cinfo
+        elif cinfo:
+            p["completion"] = cinfo
+
+    # ---- 第三遍：太短的丢掉 + 反重合 + 落盘 ----
+    bridged_px = []
+    for p in picks:
+        s, anchors, color, how = p["s"], p["anchors"], p["color"], p["how"]
+        trace, kind, info = p["trace"], p["kind"], p["info"]
+        span = ((max(q[0] for q in trace) - min(q[0] for q in trace))
+                / max(1.0, frame[2] - frame[0])) if trace else 0.0
+        if len(trace) < 20 or span < 0.12:
+            failed.append({"label": s.get("label"), "anchors": s.get("anchors"),
+                           "reason": (f"没追上这条线（颜色取自{how}，图上同色候选 "
+                                      f"{info.get('candidates', 0)} 条，最长只追到 "
+                                      f"{len(trace)} 点；补全后仍不足）")})
+            continue
+        # 反重合：两条曲线追成同一条轨迹是实测踩过的坑（模型的锚点都落在同一条线上时）。
+        # 先换一个同色候选，换不出来就把"与谁重合"写进报告，让人一眼看到，而不是
+        # 静默输出两份完全相同的数据。
+        note_dup = None
+        for name, other in accepted:
+            if ss.trace_overlap(trace, other) >= 0.85:
+                alt, alt_kind, alt_info = ss.trace_series(
+                    hsv, frame, color, anchors, exclude, hue_tol=p["hue_tol"],
+                    avoid={info.get("key")})
+                if (len(alt) >= 20
+                        and all(ss.trace_overlap(alt, o) < 0.85 for _n, o in accepted)):
+                    trace, kind, info = alt, alt_kind, alt_info
+                    note_dup = f"与「{name}」重合，已改用另一条同色候选"
+                else:
+                    note_dup = f"与「{name}」轨迹几乎完全重合（代码无法区分）"
+                break
+
         label = ss.safe_tag(s.get("label") or f"series{len(series) + 1}")
         want = str(s.get("output") or "line").lower()
         line_data = el.to_data(trace, frame, xmin, xmax, ymin, ymax)
@@ -317,23 +387,50 @@ def _extract_seeded(panel, panel_path, rng, csv_dir, spec):
             ss.write_csv(name, line_data)
             emitted.append(("line", name))
         if not emitted:
-            failed.append({"label": s.get("label"), "reason": "追踪出的点太少，未写出"})
+            failed.append({"label": s.get("label"), "anchors": s.get("anchors"),
+                           "reason": "追踪出的点太少，未写出"})
             continue
-        for kind, name in emitted:
-            data = point_data if kind == "points" else line_data
+        used_keys.add(info.get("key"))
+        accepted.append((s.get("label"), trace))
+        color_hex = "#{:02x}{:02x}{:02x}".format(int(color[2]), int(color[1]),
+                                                 int(color[0]))
+        cinfo = p["completion"] or {}
+        raw = p.get("raw_trace")
+        if raw and cinfo:
+            rx = {int(round(x)) for x, _y in raw}
+            bridged_px.extend((x, y) for x, y in trace if int(round(x)) not in rx)
+        completion = jsonable_completion(cinfo)
+        for kind_out, name in emitted:
+            data = point_data if kind_out == "points" else line_data
             series.append({
-                "file": name.name, "source": "seeded", "kind": kind,
-                "series_name": s.get("label"), "output": want,
-                "color_hex": s.get("color"), "y_axis": s.get("y_axis"),
+                "file": name.name, "source": "seeded", "kind": kind_out,
+                "geometry": kind, "series_name": s.get("label"), "output": want,
+                "color_hex": color_hex, "color_src": how, "y_axis": s.get("y_axis"),
                 "anchors": s.get("anchors"), "note": s.get("note"),
-                "coverage": info.get("coverage"), "points": len(data),
+                "anchors_hit": info.get("hits"),
+                "anchor_med_dist": (round(info["med_dist"], 1)
+                                    if info.get("med_dist") is not None else None),
+                "coverage": round(span, 3), "points": len(data),
+                "duplicate_note": note_dup, "completion": completion,
                 "x_range": [round(min(p[0] for p in data), 4), round(max(p[0] for p in data), 4)],
                 "y_range": [round(min(p[1] for p in data), 4), round(max(p[1] for p in data), 4)],
             })
     if not series and not failed:
         return None
     return {"panel": panel_path.name, "frame": list(frame), "series": series,
-            "failed": failed, "method": "seeded"}
+            "failed": failed, "bridged_px": bridged_px, "method": "seeded"}
+
+
+def jsonable_completion(cinfo):
+    """补全信息进 config/report 前瘦身（只留计数与前几段，避免 JSON 膨胀）。"""
+    if not cinfo:
+        return None
+    return {"bridged_cols": int(cinfo.get("bridged_cols") or 0),
+            "filled": int(cinfo.get("filled") or 0),
+            "spans": [{"x0": int(s["x0"]), "x1": int(s["x1"]), "cols": int(s["cols"]),
+                       "by": str(s.get("by"))} for s in (cinfo.get("spans") or [])[:8]],
+            "open_gaps": [{"x0": int(s["x0"]), "x1": int(s["x1"]), "cols": int(s["cols"])}
+                          for s in (cinfo.get("open_gaps") or [])[:8]]}
 
 
 def series_y_from(panel):
@@ -986,15 +1083,38 @@ def write_report(config, path, phase, results=None):
             r = results[p["id"]]
             lines.append(f"- 提取结果: {len(r['series'])} 条曲线")
             for s in r["series"]:
+                extra = []
+                if s.get("geometry") == "loop":
+                    extra.append("闭合回线（沿轮廓取点，不是按 x 排序）")
+                if s.get("color_src"):
+                    extra.append(f"颜色取自{s['color_src']}")
+                if s.get("anchors_hit") is not None:
+                    extra.append(f"锚点命中 {s['anchors_hit']} 个"
+                                 + (f"，中位偏差 {s['anchor_med_dist']}px"
+                                    if s.get("anchor_med_dist") is not None else ""))
+                if s.get("duplicate_note"):
+                    extra.append("⚠️ " + s["duplicate_note"])
+                comp = s.get("completion") or {}
+                if comp.get("bridged_cols"):
+                    bys = sorted({str(x.get("by")) for x in (comp.get("spans") or [])})
+                    extra.append(f"补全 {comp['bridged_cols']} 列"
+                                 + (f"（{('、'.join(bys[:3]))}）" if bys else ""))
+                if comp.get("open_gaps"):
+                    cols = sum(int(x["cols"]) for x in comp["open_gaps"])
+                    extra.append(f"⚠️ {len(comp['open_gaps'])} 段长断口未补"
+                                 f"（共 {cols} 列，没有别的笔画经过，保持断开）")
                 lines.append(f"  - `{s['file']}`  {s['points']} 点, "
-                             f"y=[{s['y_range'][0]}, {s['y_range'][1]}]")
+                             f"y=[{s['y_range'][0]}, {s['y_range'][1]}]"
+                             + ("（" + "；".join(extra) + "）" if extra else ""))
+            for f in (r.get("failed") or []):
+                lines.append(f"  - ✗ 未追到 `{f.get('label')}`：{f.get('reason')}")
             lines.append(f"- 质检图: `verify/{p['id']}_verify.png`")
         lines.append("")
     Path(path).write_text("\n".join(lines), encoding="utf-8")
 
 
 def make_verify_image(panel_path, frame, axis, legend_colors, series_files, out_path,
-                      failed=None):
+                      failed=None, anchors=None, bridged=None):
     """Thin wrapper so callers do not have to build the series tuples themselves."""
     series = []
     for csv_path, color_hex in zip(series_files, legend_colors):
@@ -1015,7 +1135,8 @@ def make_verify_image(panel_path, frame, axis, legend_colors, series_files, out_
                     marks.append(([int(x) - 10, int(y) - 10, int(x) + 10, int(y) + 10],
                                   f"missed:{str(f.get('label'))[:12]}"))
     vo.compose_overlay(panel_path, frame, tuple(axis["x"]), tuple(axis["y"]),
-                       series, out_path, annotations=marks)
+                       series, out_path, annotations=marks, anchors=anchors,
+                       bridged=bridged)
 
 
 def extract(cfg_path, force=False, only=None, vlm=None):
@@ -1123,16 +1244,29 @@ def extract(cfg_path, force=False, only=None, vlm=None):
             log(f"      ✗ 未追到：{str(f.get('label'))[:30]}（{str(f.get('reason'))[:60]}）")
         if res.get("series"):
             files = [csv_dir / s["file"] for s in res["series"]]
-            colors = []
+            colors, anchors = [], []
+            panel_img = iio.imread(panel_path)
+            panel_h, panel_w = (panel_img.shape[0], panel_img.shape[1]) \
+                if panel_img is not None else (0, 0)
             for s in res["series"]:
                 hexs = s.get("color_hex")
                 if not hexs and s.get("target_bgr"):
                     hexs = "#{:02x}{:02x}{:02x}".format(
                         s["target_bgr"][2], s["target_bgr"][1], s["target_bgr"][0])
                 colors.append(hexs or "#ff00ff")
+                # 模型给的锚点画成十字：锚点不在线上 = 模型没指准；锚点在线上而数据
+                # 没追上来 = 追踪器的问题。QA 时一眼分得清是哪个环节坏了。
+                if s.get("anchors") and panel_w:
+                    for a in s["anchors"]:
+                        try:
+                            anchors.append((float(a[0]) * panel_w, float(a[1]) * panel_h,
+                                            str(s.get("series_name"))[:12]))
+                        except (TypeError, ValueError, IndexError):
+                            continue
             make_verify_image(panel_path, res["frame"], ax, colors, files,
                               verify_dir / f"{p['id']}_verify.png",
-                              failed=res.get("failed"))
+                              failed=res.get("failed"), anchors=anchors,
+                              bridged=res.get("bridged_px"))
 
         # ---- VLM spot check: independent re-reading of a few points ----
         if vlm is not None and res.get("series"):

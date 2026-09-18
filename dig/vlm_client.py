@@ -382,11 +382,11 @@ def mock_response(prompt):
         return json.dumps({
             "series": [
                 {"label": "Heatedtip", "y_axis": "left", "color": "#ed464e",
-                 "linestyle": "dashed", "has_markers": True, "output": "points",
+                 "linestyle": "dashed", "has_markers": True, "output": "both",
                  "anchors": [[0.08, 0.95], [0.5, 0.55], [0.92, 0.22]],
                  "note": "mock：红色虚线带方块标记"},
                 {"label": "Normaltip", "y_axis": "left", "color": "#1816c0",
-                 "linestyle": "dashed", "has_markers": True, "output": "points",
+                 "linestyle": "dashed", "has_markers": True, "output": "both",
                  "anchors": [[0.08, 0.97], [0.5, 0.52], [0.92, 0.20]],
                  "note": "mock：蓝色虚线带方块标记"}],
             "ignore": [{"what": "蓝色实线，旁边写着 S ∝ t^0.5",

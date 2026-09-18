@@ -102,13 +102,20 @@ def draw_plot(canvas, box, series, xr, yr, xlabel, ylabel):
 
 
 def compose_overlay(image_path, frame, xrange, yrange, series, out_path,
-                    xlabel="x", ylabel="y", annotations=None):
+                    xlabel="x", ylabel="y", annotations=None, anchors=None,
+                    bridged=None):
     """Build the two-panel QA image: left = points reprojected on the figure,
     right = the extracted data replotted.
 
     `series` is a list of (label, colour, xs, ys); colour may be a name, #rrggbb or a BGR
     tuple. `annotations` is a list of (bbox, label) drawn as dashed grey boxes - used for
     the objects the model judged "not data", so a wrong verdict is visible at a glance.
+    `anchors` is a list of (x, y, label) in image pixels: the model's "this curve passes
+    about here" hints, drawn as yellow crosses so a reader can tell at a glance whether a
+    miss was the model's fault (cross off the curve) or the tracer's (cross on the curve).
+    `bridged` is a list of (x, y) in image pixels where the curve was hidden behind
+    another one: drawn as orange rings, because those values are interpolated along the
+    occluding stroke rather than measured on this curve's own pixels.
     This is the single implementation used by both the CLI and run.py.
     """
     left, top, right, bottom = frame
@@ -128,7 +135,22 @@ def compose_overlay(image_path, frame, xrange, yrange, series, out_path,
         for x, y in zip(xs, ys):
             px = int(round(left + (x - xmin) / (xmax - xmin) * (right - left)))
             py = int(round(bottom - (y - ymin) / (ymax - ymin) * (bottom - top)))
-            cv2.circle(img, (px, py), 1, (255, 0, 255), -1)
+            if 0 <= px < img.shape[1] and 0 <= py < img.shape[0]:
+                cv2.circle(img, (px, py), 1, color, -1)
+
+    for x, y, label in (anchors or []):
+        x, y = int(round(x)), int(round(y))
+        if not (0 <= x < img.shape[1] and 0 <= y < img.shape[0]):
+            continue
+        cv2.drawMarker(img, (x, y), (0, 200, 255), cv2.MARKER_CROSS, 14, 1,
+                       cv2.LINE_AA)
+        cv2.putText(img, str(label)[:14], (x + 8, y - 6), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.42, (0, 140, 190), 1, cv2.LINE_AA)
+
+    for x, y in (bridged or []):
+        x, y = int(round(x)), int(round(y))
+        if 0 <= x < img.shape[1] and 0 <= y < img.shape[0]:
+            cv2.circle(img, (x, y), 2, (0, 140, 255), 1, cv2.LINE_AA)
 
     for item in (annotations or []):
         bbox, label = item if isinstance(item, tuple) else (item["bbox"], item.get("what"))

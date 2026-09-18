@@ -17,7 +17,9 @@ lines).
 """
 
 import cv2
+import json
 import numpy as np
+from pathlib import Path
 
 import imgio as iio
 
@@ -43,18 +45,43 @@ def _clip(mask, frame, exclude_boxes):
     return out
 
 
-def ink_mask(hsv, gray, frame, exclude_boxes=()):
-    """Opaque strokes only: markers, lines and text - not the shaded error bands.
+def _remove_grid(mask, frame, frac=0.5):
+    """Zero the rows/columns that are grid or axis rules.
 
-    The bands have to be excluded *before* connected components: a dashed line drawn
-    on top of its band touches it, so the two merge into one component and the whole
-    panel becomes a single blob (measured: one 14.6k-pixel component was the band plus
-    both curves, and nothing else was found in that panel). Bands are semi-transparent
-    - high value, moderate saturation - while stroke colours are saturated or dark.
+    The local-contrast ink test picks grey grid lines up (they do contrast with the
+    paper), and a grid line traced as a "series" is exactly the kind of junk we are
+    trying to avoid. A row that is dark for most of the plot width is a rule, not data.
     """
-    sat = hsv[:, :, 1].astype(int)
-    val = hsv[:, :, 2].astype(int)
-    mask = ((sat >= STRICT_SAT) | (gray < STRICT_DARK)).astype(np.uint8) * 255
+    left, top, right, bottom = frame
+    sub = mask[top + 2:bottom - 1, left + 2:right - 1] > 0
+    if sub.size == 0:
+        return mask
+    for i, cov in enumerate(sub.mean(axis=1)):
+        if cov > frac:
+            mask[top + 2 + i, :] = 0
+    for i, cov in enumerate(sub.mean(axis=0)):
+        if cov > frac:
+            mask[:, left + 2 + i] = 0
+    return mask
+
+
+def ink_mask(img, frame, exclude_boxes=(), diff_thresh=30, bg_win=21):
+    """Strokes, markers and text - found by contrast against the *local* background.
+
+    Saturation thresholds do not work here, in either direction:
+      * a thin anti-aliased red dashed line has saturation ~45 (measured), so a
+        saturation rule of 85 - meant to exclude the shaded error bands - silently
+        deleted the line and left 45 fragments of at most 93 pixels;
+      * lowering the threshold lets the bands back in, and a line drawn on its own band
+        then touches it and the two merge into one 14.6k-pixel blob.
+
+    Comparing each pixel with the median of its neighbourhood separates the two cases
+    on the property that actually matters: a stroke contrasts with whatever is behind
+    it, while a band (and its soft edge) is smooth.
+    """
+    bg = cv2.medianBlur(img, bg_win)
+    diff = np.abs(img.astype(np.int16) - bg.astype(np.int16)).max(axis=2)
+    mask = (diff >= diff_thresh).astype(np.uint8) * 255
     return _clip(mask, frame, exclude_boxes)
 
 
@@ -306,7 +333,8 @@ def detect_objects(img, frame, exclude_boxes=(), max_objects=MAX_OBJECTS):
 
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    mask = ink_mask(hsv, gray, frame, exclude_boxes)
+    mask = ink_mask(img, frame, exclude_boxes)
+    mask = _remove_grid(mask, frame)
     left, top, right, bottom = frame
     comps = _components(mask)
     if not comps:
@@ -367,6 +395,13 @@ def detect_objects(img, frame, exclude_boxes=(), max_objects=MAX_OBJECTS):
                                                40, max_gap=90):
                 xs = [p[0] for p in pts]
                 ys = [p[1] for p in pts]
+                # 完全水平的横线 / 完全竖直的竖线 = 网格或坐标轴，不是数据曲线
+                fw = max(1, right - left)
+                fh = max(1, bottom - top)
+                if (max(ys) - min(ys)) < 0.015 * fh and (max(xs) - min(xs)) > 0.4 * fw:
+                    continue
+                if (max(xs) - min(xs)) < 0.015 * fw and (max(ys) - min(ys)) > 0.4 * fh:
+                    continue
                 cols = [img[int(y), int(x)] for x, y in pts[::max(1, len(pts) // 20)]]
                 col = tuple(int(v) for v in np.median(np.array(cols, float), axis=0))
                 objects.append({
@@ -497,6 +532,39 @@ def evidence_text(objects, frame):
                 "band": "大面积色块"}.get(o["kind"], o["kind"])
         lines.append(f"#{o['id']}: {kind} —— {describe(o, frame)}")
     return "\n".join(lines)
+
+
+def save_objects(objects, path):
+    """把检测到的几何存下来，让提取阶段用**同一份**几何。
+
+    物件编号只在"同一次检测"里有效。分析阶段用 A 版代码检测、提取阶段用 B 版重新检测，
+    编号就会错位——实测：模型判定 #4 是 Heatedtip 要提取，提取时 #4 已经是别的物件，
+    结果整个面板只输出一条 22 点的假线，两条真曲线全没了。所以几何必须落盘复用。
+    """
+    data = []
+    for o in objects:
+        d = {k: v for k, v in o.items() if k != "pixels"}     # 掩膜太大且可重建
+        for key in ("trace", "centroids"):
+            if isinstance(d.get(key), list):
+                d[key] = [[float(p[0]), float(p[1])] for p in d[key]]
+        data.append(d)
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    return p
+
+
+def load_objects(path):
+    """读回 save_objects 写的几何（坐标还原成元组）。"""
+    p = Path(path)
+    if not p.exists():
+        return None
+    data = json.loads(p.read_text(encoding="utf-8"))
+    for o in data:
+        for key in ("trace", "centroids"):
+            if o.get(key):
+                o[key] = [(float(q[0]), float(q[1])) for q in o[key]]
+    return data
 
 
 def render_sheet(img, objects, frame, out_path, tile=260, cols=4):

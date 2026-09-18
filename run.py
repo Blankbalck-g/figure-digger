@@ -251,11 +251,26 @@ def _extract_panel(panel, panel_path, rng, csv_dir):
     decisions = (panel.get("objects") or {}).get("decisions") or []
     if decisions:
         try:
-            panel_img = iio.imread(panel_path)
-            if panel_img is not None:
-                gray_p = cv2.cvtColor(panel_img, cv2.COLOR_BGR2GRAY)
-                frame_p = be._frame_of(gray_p, panel.get("frame"))
-                objs = ob.detect_objects(panel_img, frame_p, be.inner_boxes(gray_p, frame_p))
+            outdir = Path(csv_dir).parent
+            frame_p = tuple(panel.get("frame") or ())
+            # 几何优先用分析阶段存下来的那一份：编号必须和模型判定时看到的一致
+            geom = (panel.get("objects") or {}).get("geometry")
+            objs = None
+            if geom:
+                gp = Path(geom)
+                objs = ob.load_objects(gp if gp.is_absolute() else outdir / gp)
+            if objs is None:
+                panel_img = iio.imread(panel_path)
+                if panel_img is not None:
+                    gray_p = cv2.cvtColor(panel_img, cv2.COLOR_BGR2GRAY)
+                    frame_p = be._frame_of(gray_p, panel.get("frame"))
+                    objs = ob.detect_objects(panel_img, frame_p,
+                                             be.inner_boxes(gray_p, frame_p))
+                    log("      ⚠ 该面板没有保存的物件几何，改用现场检测——"
+                        "编号可能与模型判定时不一致，建议重跑 analyze")
+            if objs:
+                if not frame_p:
+                    frame_p = tuple(panel.get("frame") or ())
                 series, skipped = be.process_objects(panel_path, frame_p, objs, decisions,
                                                      rng, csv_dir)
                 if series or skipped:
@@ -804,8 +819,10 @@ def analyze(pdf_path, outdir, dpi=300, vlm=None, pages=None, use_ocr=None, want=
                         ) or "、".join(legend_colors)
                         dec = vt.judge_objects(vlm, sheet, legend_text,
                                                ob.evidence_text(objs, frame))
+                        geom = ob.save_objects(objs, outdir / "objects" / f"{pid}_objects.json")
                         entry["objects"] = {
                             "sheet": str(sheet.relative_to(outdir)) if sheet.is_relative_to(outdir) else str(sheet),
+                            "geometry": str(geom.relative_to(outdir)) if geom.is_relative_to(outdir) else str(geom),
                             "decisions": dec.get("objects") or [],
                             "notes": dec.get("notes"),
                         }

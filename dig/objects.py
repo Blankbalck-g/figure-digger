@@ -65,23 +65,37 @@ def _remove_grid(mask, frame, frac=0.5):
     return mask
 
 
-def ink_mask(img, frame, exclude_boxes=(), diff_thresh=30, bg_win=21):
-    """Strokes, markers and text - found by contrast against the *local* background.
+def ink_mask(img, frame, exclude_boxes=(), sat_strong=85, dark=110,
+             sat_weak=32, diff_weak=25, bg_win=21):
+    """Strokes, markers and text - saturated or dark, plus faint coloured strokes.
 
-    Saturation thresholds do not work here, in either direction:
-      * a thin anti-aliased red dashed line has saturation ~45 (measured), so a
-        saturation rule of 85 - meant to exclude the shaded error bands - silently
-        deleted the line and left 45 fragments of at most 93 pixels;
-      * lowering the threshold lets the bands back in, and a line drawn on its own band
-        then touches it and the two merge into one 14.6k-pixel blob.
+    Two failure modes had to be satisfied at once:
+      * a saturation-only rule of 85 (meant to exclude the semi-transparent error
+        bands) also deleted thin anti-aliased lines: the red dashed line measures
+        saturation 41-47, so it came out as 45 fragments of at most 93 pixels;
+      * a pure "contrast against the local background" rule fixed that but let the
+        grey grid lines and the *edges of the error bands* in, which merged into one
+        object covering the whole plot - and then the real blue line was not detected
+        as a line at all (measured on 2026-01-0340 p10_img1_p2: the panel that used to
+        work came back with one series instead of two).
 
-    Comparing each pixel with the median of its neighbourhood separates the two cases
-    on the property that actually matters: a stroke contrasts with whatever is behind
-    it, while a band (and its soft edge) is smooth.
+    So: saturated or dark as before, **plus** faintly coloured pixels that contrast
+    with their neighbourhood (the faded dashes lying on a band). Grey grid lines have
+    almost no saturation and are not dark, so they stay out.
+
+    A dash that lies *on* its own error band is still partly lost: it contrasts with
+    the band by only 10-29, and the band's own interior noise reaches 12-20, so no
+    threshold separates them (tried 12: the bands came back as light-pink "lines";
+    tried 25: those dashes stay missing). Fixing that needs a colour-relative
+    criterion, not a luminance one - see the note in the README.
     """
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    sat = hsv[:, :, 1].astype(int)
     bg = cv2.medianBlur(img, bg_win)
     diff = np.abs(img.astype(np.int16) - bg.astype(np.int16)).max(axis=2)
-    mask = (diff >= diff_thresh).astype(np.uint8) * 255
+    mask = (((sat >= sat_strong) | (gray < dark)
+             | ((sat >= sat_weak) & (diff >= diff_weak))).astype(np.uint8) * 255)
     return _clip(mask, frame, exclude_boxes)
 
 
@@ -339,6 +353,18 @@ def detect_objects(img, frame, exclude_boxes=(), max_objects=MAX_OBJECTS):
     comps = _components(mask)
     if not comps:
         return []
+    # 绕着大片区域的"细环" = 误差带边界 / 坐标框，不是数据曲线。不排掉的话它会成为
+    # 一个覆盖整个绘图区的对象，把真正的曲线挤出清单（实测 2026-01-0340 p2：
+    # 蓝线因此根本没被检成线，模型只能对着灰块判，最后一条都没写出来）。
+    plot_area = max(1, (right - left) * (bottom - top))
+    ringless = []
+    for c in comps:
+        fill = c["area"] / max(1.0, float(c["w"] * c["h"]))
+        if (c["w"] * c["h"] > 0.25 * plot_area and fill < 0.15
+                and (c["w"] > 0.35 * (right - left) or c["h"] > 0.35 * (bottom - top))):
+            continue
+        ringless.append(c)
+    comps = ringless
     for c in comps:
         c["color"] = _median_color(img, mask, c)
         c["hue"] = _hue(c["color"])

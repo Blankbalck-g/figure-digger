@@ -71,6 +71,7 @@ import verify_overlay as vo  # noqa: E402
 import vector_extract as vx  # noqa: E402
 import vlm_client as vlmc  # noqa: E402
 import vlm_tasks as vt  # noqa: E402
+import template_out as tpl  # noqa: E402
 
 # 并行批处理时子进程不往终端打（会互相穿插），而是各写一份 <out>/<pdf>/run.log。
 _LOG_FILE = None
@@ -813,6 +814,46 @@ def _as_float(value, default=1.0):
         return default
 
 
+def _axis_hint(want):
+    """把用户需求交给轴读数那一步顺带核对——不额外调用，也不靠"模型觉得像"。
+
+    实测：`--want "贯穿距随时间变化"` 会把"贯穿距 vs 曲轴转角"也算命中。这里让模型在
+    读刻度时就回答"这张图的横轴/纵轴是不是用户要的"，命中靠标题核对。
+    """
+    if not want:
+        return None
+    return (f"用户要的是：{want}。请额外读出 x 轴与各纵轴的标题/单位，并判断这张图的"
+            f"横轴与纵轴是否就是用户要的那两个量：符合填 matches_request=true，不符合填 "
+            f"false（例如用户要时间轴而这里是曲轴转角），看不清填 null。")
+
+
+def _record_axis_check(entry, va, want, log):
+    """把轴标题与"是否合需求"记进 config；明确不符合的图直接标跳过（报告里给理由）。"""
+    x = va.get("x") if isinstance(va.get("x"), dict) else {}
+    ylist = [d for d in (va.get("y_axes") or []) if isinstance(d, dict)]
+    y0 = ylist[0] if ylist else {}
+    entry["axis"]["x_title"] = x.get("title")
+    entry["axis"]["x_unit"] = x.get("unit")
+    entry["axis"]["y_title"] = y0.get("title")
+    titles = (f"x={x.get('title')}"
+              + (f" [{x.get('unit')}]" if x.get("unit") else "")
+              + f" / y={y0.get('title')}"
+              + (f" [{y0.get('unit')}]" if y0.get("unit") else ""))
+    if not want:
+        return
+    match, note = va.get("matches_request"), va.get("match_note")
+    entry["axis_check"] = {"want": want, "matches": match, "note": note,
+                           "x_title": x.get("title"), "y_title": y0.get("title")}
+    verdict = "符合" if match is True else ("不符合" if match is False else "看不清")
+    log(f"      轴标题核对（{verdict}）: {titles}"
+        + (f" —— {str(note)[:60]}" if note else ""))
+    if match is False:
+        entry["skip"] = True
+        entry["skip_reason"] = (f"轴标题与需求不符（x={x.get('title')} / "
+                                f"y={y0.get('title')}）：{str(note or '')[:80]}")
+        log("      ⏭ 按需求跳过这张图（轴标题核对没通过）")
+
+
 def _norm_y_axes(vlm_result):
     """VLM may return a list of y axes (left/right) or a single 'y'.
 
@@ -827,7 +868,7 @@ def _norm_y_axes(vlm_result):
         if rng:
             out[side] = {"range": rng, "labels": item.get("labels"),
                          "multiplier": _as_float(item.get("multiplier"), 1.0),
-                         "unit": item.get("unit")}
+                         "unit": item.get("unit"), "title": item.get("title")}
     if not out:
         single = _norm_axis(vlm_result.get("y"))
         if single:
@@ -1171,7 +1212,7 @@ def analyze(pdf_path, outdir, dpi=300, vlm=None, pages=None, use_ocr=None, want=
             va = None
             if vlm is not None:
                 try:
-                    va = vt.read_axis_ranges(vlm, panel_path)
+                    va = vt.read_axis_ranges(vlm, panel_path, hint=_axis_hint(want))
                     y_axes = _norm_y_axes(va)
                     entry["vlm_axis"] = {"x": va.get("x"), "y_axes": va.get("y_axes"),
                                          "y": va.get("y"),
@@ -1179,6 +1220,7 @@ def analyze(pdf_path, outdir, dpi=300, vlm=None, pages=None, use_ocr=None, want=
                                          "note": va.get("note")}
                     if y_axes:
                         entry["y_axes"] = y_axes
+                    _record_axis_check(entry, va, want, log)
                     log("      VLM 轴读数: x=" + str(_norm_axis(va.get("x")))
                         + "  y=" + (", ".join(
                             f"{k}轴{[round(d['range'][0], 4), round(d['range'][1], 4)]}"
@@ -1365,6 +1407,18 @@ def write_report(config, path, phase, results=None):
                + "、".join(f"{k}×{float(v):g}" for k, v in (ax.get("multiplier") or {}).items())
                + "（CSV 里的数值已按此换算）" if ax.get("multiplier") else ""),
         ]
+        if ax.get("x_title") or ax.get("y_title"):
+            chk = p.get("axis_check") or {}
+            verdict = ("✅ 符合" if chk.get("matches") is True else
+                       "❌ 不符合（已跳过）" if chk.get("matches") is False else
+                       "⚠️ 看不清（保留）" if chk else "")
+            lines.append(f"- 轴标题: x={ax.get('x_title') or '?'}"
+                         + (f" [{ax.get('x_unit')}]" if ax.get("x_unit") else "")
+                         + f"  y={ax.get('y_title') or '?'}"
+                         + (f"  需求核对: {verdict} — {str(chk.get('note') or '')[:80]}"
+                            if verdict else ""))
+        if p.get("skip") and p.get("skip_reason"):
+            lines.append(f"- ⏭ 跳过原因: {p['skip_reason']}")
         ocr = p.get("ocr", {})
         for axis in ("x", "y"):
             if axis in ocr:
@@ -1457,7 +1511,38 @@ def make_verify_image(panel_path, frame, axis, legend_colors, series_files, out_
                        bridged=bridged)
 
 
-def extract(cfg_path, force=False, only=None, vlm=None):
+def _write_template_output(fmt, res, panel, panel_path, csv_dir, outdir, vlm, log):
+    """把这一面板的曲线按用户模板再输出一份（模板代码由模型写一次，之后复用）。"""
+    series = []
+    for s in res["series"]:
+        xs, ys = vo.read_csv(csv_dir / s["file"])
+        if xs:
+            series.append({"name": str(s.get("series_name") or Path(s["file"]).stem),
+                           "file": s["file"], "x": xs, "y": ys, "params": {}})
+    if not series:
+        return
+    if fmt.params:                      # 模板要参数 -> 模型读数、代码填空（读不到留空）
+        vals = tpl.ask_params(vlm, panel_path, panel.get("caption"), series, fmt.params)
+        for item in series:
+            item["params"] = {k: str((vals.get(item["name"]) or {}).get(k, ""))
+                              for k in fmt.params}
+    try:
+        files = fmt.render(series, {"paper": panel_path.parent.parent.name,
+                                    "panel": panel["id"], "ext": fmt.ext,
+                                    "template": fmt.name}) or {}
+    except Exception as exc:  # noqa: BLE001 - 模板坏了不该拖垮提取
+        log(f"      （模板渲染失败，跳过：{type(exc).__name__}: {exc}）")
+        return
+    dest = Path(outdir) / "templates" / Path(str(fmt.name)).stem
+    for fname, text in files.items():
+        p = dest / Path(str(fname)).name               # 只取文件名，防目录穿越
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(str(text), encoding="utf-8")
+    log(f"      模板输出 {len(files)} 个文件 -> {dest}")
+
+
+def extract(cfg_path, force=False, only=None, vlm=None, template=None):
+    """template: 文件路径 = 用这个模板；None = 沿用上次的模板；False = 不用模板（只出 CSV）。"""
     t0 = time.time()
     cfg_path = Path(cfg_path).resolve()
     config = json.loads(cfg_path.read_text(encoding="utf-8"))
@@ -1467,6 +1552,12 @@ def extract(cfg_path, force=False, only=None, vlm=None):
     verify_dir = outdir / "verify"
     csv_dir.mkdir(parents=True, exist_ok=True)
     verify_dir.mkdir(parents=True, exist_ok=True)
+    fmt = None
+    if template is not False:
+        try:
+            fmt = tpl.load(template, vlm=vlm, log=log)
+        except Exception as exc:  # noqa: BLE001 - 模板不可用不该拖垮提取
+            log(f"      （模板不可用，只出 CSV：{type(exc).__name__}: {exc}）")
 
     # 重跑时先清掉这次要覆盖的旧产物：否则新旧结果混在一个目录里，
     # 分不清哪个 CSV 是这一次的（实测把这批论文重跑时踩到过）
@@ -1592,6 +1683,8 @@ def extract(cfg_path, force=False, only=None, vlm=None):
                if res.get("series") else ""))
         for f in res.get("failed") or []:
             log(f"      ✗ 未追到：{str(f.get('label'))[:30]}（{str(f.get('reason'))[:60]}）")
+        if fmt and res.get("series"):
+            _write_template_output(fmt, res, p, panel_path, csv_dir, outdir, vlm, log)
         if res.get("series"):
             files = [csv_dir / s["file"] for s in res["series"]]
             colors, anchors = [], []
@@ -1691,7 +1784,7 @@ def extract(cfg_path, force=False, only=None, vlm=None):
 
 
 def _run_one(pdf, sub, row, dpi, pages, force, vlm, use_ocr, want=None, want_deep=False,
-             find_series=True):
+             find_series=True, template=None):
     """One PDF end-to-end (analyze + extract). Shared by serial and parallel batch."""
     cfg = analyze(pdf, sub, dpi=dpi, vlm=vlm, pages=pages, use_ocr=use_ocr, want=want,
                   want_deep=want_deep, find_series=find_series)
@@ -1700,7 +1793,7 @@ def _run_one(pdf, sub, row, dpi, pages, force, vlm, use_ocr, want=None, want_dee
         row["matched"] = len(config["selection"].get("ids") or [])
     row["panels"] = len([p for p in config["panels"] if not p.get("skip")])
     row["panels_skipped"] = len([p for p in config["panels"] if p.get("skip")])
-    results = extract(cfg, force=force, vlm=vlm) or {}
+    results = extract(cfg, force=force, vlm=vlm, template=template) or {}
     row["curves"] = sum(len(r.get("series", [])) for r in results.values())
     for r in results.values():
         sc = r.get("spot_check") or {}
@@ -1726,7 +1819,7 @@ def _log_row(row, with_vlm):
 
 
 def _batch_one(pdf_str, sub_str, dpi, pages, force, vlm_spec, use_ocr, want=None,
-               want_deep=False, find_series=True):
+               want_deep=False, find_series=True, template=None):
     """Worker body for --jobs > 1: one PDF per process.
 
     Output goes to that paper's own run.log - several processes printing to one terminal
@@ -1747,7 +1840,7 @@ def _batch_one(pdf_str, sub_str, dpi, pages, force, vlm_spec, use_ocr, want=None
                 client = None
         _LOG_FILE = (sub / "run.log").open("w", encoding="utf-8")
         _run_one(pdf, sub, row, dpi, pages, force, client, use_ocr, want, want_deep,
-                 find_series)
+                 find_series, template)
     except Exception as exc:  # noqa: BLE001
         row["error"] = f"{type(exc).__name__}: {exc}"
         log(f"  ✗ 失败: {row['error']}")
@@ -1764,7 +1857,7 @@ def _batch_one(pdf_str, sub_str, dpi, pages, force, vlm_spec, use_ocr, want=None
 
 
 def _batch_serial(pdfs, outdir, dpi, pages, force, vlm, use_ocr, want=None,
-                  want_deep=False, find_series=True):
+                  want_deep=False, find_series=True, template=None):
     rows = []
     for i, pdf in enumerate(pdfs, start=1):
         t_file = time.time()
@@ -1774,7 +1867,7 @@ def _batch_serial(pdfs, outdir, dpi, pages, force, vlm, use_ocr, want=None,
         row = new_row(pdf, sub)
         try:
             _run_one(pdf, sub, row, dpi, pages, force, vlm, use_ocr, want, want_deep,
-                     find_series)
+                     find_series, template)
         except Exception as exc:  # noqa: BLE001
             row["error"] = f"{type(exc).__name__}: {exc}"
             log(f"  ✗ 失败: {row['error']}")
@@ -1790,7 +1883,7 @@ def _batch_serial(pdfs, outdir, dpi, pages, force, vlm, use_ocr, want=None,
 
 
 def _batch_parallel(pdfs, outdir, jobs, dpi, pages, force, vlm, use_ocr, want=None,
-                    want_deep=False, find_series=True):
+                    want_deep=False, find_series=True, template=None):
     from concurrent.futures import ProcessPoolExecutor, as_completed
 
     spec = {"model": vlm.model, "base_url": vlm.base_url} if vlm is not None else None
@@ -1798,7 +1891,7 @@ def _batch_parallel(pdfs, outdir, jobs, dpi, pages, force, vlm, use_ocr, want=No
     with ProcessPoolExecutor(max_workers=jobs) as ex:
         futures = {ex.submit(_batch_one, str(pdf), str(outdir / pdf.stem), dpi, pages,
                              force, spec, use_ocr, want, want_deep,
-                             find_series): pdf for pdf in pdfs}
+                             find_series, template): pdf for pdf in pdfs}
         for fut in as_completed(futures):
             pdf = futures[fut]
             done += 1
@@ -1816,7 +1909,7 @@ def _batch_parallel(pdfs, outdir, jobs, dpi, pages, force, vlm, use_ocr, want=No
 
 def batch(dir_path, outdir, dpi=300, vlm=None, pages=None, force=False,
           pattern="*.pdf", recursive=False, use_ocr=True, jobs=1, want=None,
-          want_deep=False, find_series=True):
+          want_deep=False, find_series=True, template=None):
     """Process every PDF in a folder, then write a combined summary.
 
     jobs=1 keeps everything in one process (shared OCR engine / VLM client and caches).
@@ -1841,14 +1934,14 @@ def batch(dir_path, outdir, dpi=300, vlm=None, pages=None, force=False,
 
     if jobs > 1:
         rows = _batch_parallel(pdfs, outdir, jobs, dpi, pages, force, vlm, use_ocr, want,
-                               want_deep, find_series)
+                               want_deep, find_series, template)
         # 用量在子进程里累计，父进程按行加总后再打印
         if vlm is not None:
             for k in vlm.usage:
                 vlm.usage[k] = sum(r.get("usage", {}).get(k, 0) for r in rows)
     else:
         rows = _batch_serial(pdfs, outdir, dpi, pages, force, vlm, use_ocr, want,
-                             want_deep, find_series)
+                             want_deep, find_series, template)
 
     md = ["# 批量提取汇总", "",
           f"- 来源目录: `{src}`", f"- 处理文件: {len(pdfs)} 个", ""]
@@ -1951,6 +2044,9 @@ def main():
     e.add_argument("--vlm", action="store_true", help="提取后用 VLM 抽查校验")
     e.add_argument("--vlm-model", default=vlmc.DEFAULT_MODEL)
     e.add_argument("--vlm-base-url", default=vlmc.DEFAULT_BASE_URL)
+    e.add_argument("--template", default=None,
+                   help="按这个模板文件（txt/dat 等）再输出一份；模型只读一次即缓存")
+    e.add_argument("--no-template", action="store_true", help="不用模板（只出 CSV）")
 
     c = sub.add_parser("confirm", help="确认/修正某个面板的轴范围")
     c.add_argument("config")
@@ -1973,6 +2069,9 @@ def main():
     al.add_argument("--want", default=None, help="用一句话说要哪些图（见 README）")
     al.add_argument("--want-deep", action="store_true", help="再用正文段落判定一次")
     al.add_argument("--no-find-series", action="store_true", help="不让模型找曲线")
+    al.add_argument("--template", default=None,
+                    help="按这个模板文件（txt/dat 等）再输出一份；模型只读一次即缓存")
+    al.add_argument("--no-template", action="store_true", help="不用模板（只出 CSV）")
 
     b = sub.add_parser("batch", help="批量处理一个目录下的所有 PDF，并输出汇总")
     b.add_argument("dir")
@@ -1993,6 +2092,9 @@ def main():
                    help="用一句话说要哪些图；每篇都按同一句需求筛")
     b.add_argument("--want-deep", action="store_true", help="再用正文段落判定一次")
     b.add_argument("--no-find-series", action="store_true", help="不让模型找曲线")
+    b.add_argument("--template", default=None,
+                   help="按这个模板文件（txt/dat 等）再输出一份；模型只读一次即缓存")
+    b.add_argument("--no-template", action="store_true", help="不用模板（只出 CSV）")
 
     sub.add_parser("doctor", help="环境自检：解释器、依赖、API key")
 
@@ -2032,7 +2134,8 @@ def main():
                 find_series=not args.no_find_series)
     elif args.cmd == "extract":
         extract(args.config, force=args.force,
-                only=set(args.only) if args.only else None, vlm=make_vlm())
+                only=set(args.only) if args.only else None, vlm=make_vlm(),
+                template=False if args.no_template else args.template)
     elif args.cmd == "confirm":
         confirm(args.config, args.id, args.x, args.y, args.skip)
     elif args.cmd == "all":
@@ -2040,14 +2143,16 @@ def main():
         cfg = analyze(args.pdf, args.out, args.dpi, vlm=client, pages=args.pages,
                       use_ocr=use_ocr(), want=args.want, want_deep=args.want_deep,
                       find_series=not args.no_find_series)
-        extract(cfg, force=args.force, vlm=client)
+        extract(cfg, force=args.force, vlm=client,
+                template=False if args.no_template else args.template)
         if client is not None:
             print_vlm_usage(client, "本次合计")
     elif args.cmd == "batch":
         batch(args.dir, args.out, dpi=args.dpi, vlm=make_vlm(), pages=args.pages,
               force=args.force, pattern=args.pattern, recursive=args.recursive,
               use_ocr=use_ocr(), jobs=args.jobs, want=args.want,
-              want_deep=args.want_deep, find_series=not args.no_find_series)
+              want_deep=args.want_deep, find_series=not args.no_find_series,
+              template=False if args.no_template else args.template)
     elif args.cmd == "doctor":
         doctor()
 

@@ -31,6 +31,12 @@ python run.py batch ./papers --out ./out --recursive      # 含子目录
 python run.py batch ./papers --out ./out --jobs 4         # 4 篇并行（每篇一个进程）
 python run.py batch ./papers --out ./out --vlm --want "速度随时间的折线图"   # 8 篇里哪些有这张图
 
+# 2b) 还要一份"模板格式"的结果：给一个 txt/dat 模板，模型读一次编译成代码后缓存
+python run.py all   paper.pdf --out out --vlm --template my_format.dat
+python run.py batch ./papers  --out ./out --vlm --template my_format.dat   # 每篇都出一份
+python run.py extract out/paper/paper_config.json --template my_format.dat # 只重出模板文件
+python run.py extract out/paper/paper_config.json --no-template            # 不要模板（只出 CSV）
+
 # 3) 启用 VLM（分类 / 轴读数 / 系列命名 / 抽查校验）
 copy deepseek_key.txt.example deepseek_key.txt            # 填入 key（或用环境变量 DEEPSEEK_API_KEY）
 python vlm_client.py --check                              # 验证 key
@@ -67,6 +73,11 @@ python run.py all  paper.pdf --out out --vlm --want "Figure 5, 图7"     # 说�
    看图就能定下来时**不跑**这一步；想每次都跑加 `--want-deep`。
 5. **论文里没有这张图就直说没有**：不会硬挑一张最像的，而是告诉你"这篇里没有匹配的图"，
    并列出实际的图清单（图号 + 图注），你可以换个说法或直接写图号再来一次。
+6. **命中要过"轴标题"这一关**（不额外调用）：模型读刻度时会顺带读出 x 轴与各纵轴的
+   **标题/单位**，并判断"这张图的横轴/纵轴是不是你要的那两个量"。要"贯穿距随时间变化"，
+   横轴就必须是时间、纵轴必须是贯穿距——横轴是曲轴转角、纵轴是锥角/动量通量的会被
+   **标为跳过并写明理由**（`report.md` 里 `⏭ 跳过原因`），不再只靠"模型觉得像"。
+   标题看不清时**保留**面板并标 `⚠️ 看不清（保留）`，宁可让人复核也不静默丢数据。
 
 挑选依据会写进 `out/<PDF>/report.md` 的表格（每张候选图列出图号、图注、是否选中）；
 模型看到的那张对照图留在 `out/select/contact_sheet.png`，可以复核它是不是看错了。
@@ -86,6 +97,10 @@ python run.py all  paper.pdf --out out --vlm --want "Figure 5, 图7"     # 说�
 ## ✨ 核心特性
 
 - **PDF → 数据一条命令**：分诊图与图注、切分多子图、定标、提取、质检、报告
+- **按你的模板出结果** 📄：`--template my_format.dat` 给一份模板（txt/dat/csv/任意文本），
+  模型读**一次**就把它编译成渲染代码并缓存（同模板再来 0 token）；模板里要按曲线标注
+  参数（燃料、压力、工况…）时，模型只负责从图例/标题/标注里**读数**，填空由代码做，
+  读不到的留空。不传 `--template` 就沿用上次的模板，从没用过就只出 CSV
 - **一句话指定要哪张图** 🎯：`--want "800 bar 下速度随时间的折线图"`；图注与图先一对一配对（一页多图也不会张冠李戴），再由模型看图选图；**论文里没有这张图就直说没有**，并列出实际有哪些图
 - **看不准再读正文** 📖：`--want` 定不下来时，自动拿"正文里提到图的句子"（占全文 3–12%）再判一次——`Figure 5 presents…at Pi = 800 bar` 这种条件归属只有正文写；`--want-deep` 可强制每次都读
 - **矢量图无损提取** 🎯：直接读 PDF 路径坐标与真实刻度文字，**实测零误差**（不需要 OCR 与模型）
@@ -132,6 +147,7 @@ figure-digger/
 out/
 ├── figures/   从 PDF 抠出的图          panels/  切分后的子图
 ├── csv/       提取结果（一条曲线一个 CSV）★ 真正的成果
+├── templates/ --template 渲染出来的结果文件（子目录 = 模板名）
 ├── verify/    质检叠加图（人眼复核用）
 ├── review/    复盘轮留档（<面板>_review.png = 给模型看的编号图，_review.json = 它的答复）
 ├── debug/     刻度标签带裁剪图（只有跑 OCR 时才有：--ocr 或纯 OCR 流程）
@@ -141,22 +157,22 @@ out/
 └── batch_summary.md      批量模式的汇总表
 ```
 
-除 `csv/` 外全部可由重跑重建；`.vlm_cache/`（VLM 结果缓存，命中则不调 API）与 `.vlm_log.jsonl`（审计日志）也在 `.gitignore` 中。
-🧹 **提交前清理**：`rm -rf out_* *_out output .vlm_cache .vlm_log.jsonl __pycache__`
+除 `csv/` 外全部可由重跑重建；`.vlm_cache/`（VLM 结果缓存，命中则不调 API）、`.templates/`（模板编译出来的渲染代码，命中则 0 token）与 `.vlm_log.jsonl`（审计日志）也在 `.gitignore` 中。
+🧹 **提交前清理**：`rm -rf out_* *_out output .vlm_cache .vlm_log.jsonl .templates __pycache__`
 
 ## ⌨️ 命令行参考
 
 | 命令 | 作用 |
 |---|---|
-| `run.py all <pdf> --out DIR [--vlm] [--want "…"] [--pages 7] [--force] [--no-ocr]` | 一篇走完：分析 + 提取 |
-| `run.py batch <dir> --out DIR [--vlm] [--want "…"] [--jobs 4] [--recursive] [--pattern "*.pdf"]` | 批量处理目录下所有 PDF + 汇总 |
+| `run.py all <pdf> --out DIR [--vlm] [--want "…"] [--pages 7] [--force] [--no-ocr] [--template F]` | 一篇走完：分析 + 提取（+ 模板输出） |
+| `run.py batch <dir> --out DIR [--vlm] [--want "…"] [--jobs 4] [--recursive] [--pattern "*.pdf"] [--template F]` | 批量处理目录下所有 PDF + 汇总 |
 | `run.py analyze <pdf> --out DIR [--vlm] [--ocr]` | 只做分析，产出 config 供人工确认 |
-| `run.py extract <config.json> [--force] [--only ID...] [--vlm]` | 按 config 提取（只跑已确认的面板） |
+| `run.py extract <config.json> [--force] [--only ID...] [--vlm] [--template F] [--no-template]` | 按 config 提取（只跑已确认的面板） |
 | `run.py confirm <config.json> --id ID [--x 0,8] [--y 0,3] [--skip]` | 确认 / 修正 / 跳过某个面板 |
 | `run.py doctor` | 环境自检（解释器、依赖、key） |
 | `python dig/vlm_client.py --check / --probe / --stats / --image-tokens / --probe-image` | key、实际模型、token 统计、单图 token |
 
-常用参数：`--vlm` 启用 VLM；`--want "…"` 一句话指定要哪几张图；`--want-deep` 再用正文段落判定一次；`--vlm-model` / `--vlm-base-url` 覆盖默认模型与端点；`--pages` 只处理指定页；`--force` 跳过确认检查；`--jobs N` 并行批量（每篇一个进程，N 建议 ≤ CPU 核数）；`--no-ocr` 显式不再跑刻度 OCR；`--ocr` 即使在 `--vlm` 下也跑 OCR 做交叉核对。
+常用参数：`--vlm` 启用 VLM；`--want "…"` 一句话指定要哪几张图（命中要过轴标题核对）；`--want-deep` 再用正文段落判定一次；`--template F` 按模板文件再输出一份（不给 = 沿用上次的模板，`--no-template` = 不要模板）；`--vlm-model` / `--vlm-base-url` 覆盖默认模型与端点；`--pages` 只处理指定页；`--force` 跳过确认检查；`--jobs N` 并行批量（每篇一个进程，N 建议 ≤ CPU 核数）；`--no-ocr` 显式不再跑刻度 OCR；`--ocr` 即使在 `--vlm` 下也跑 OCR 做交叉核对。
 🔧 `dig/` 里的每个模块都能单独跑（如 `python dig/triage_pdf.py paper.pdf`、`python dig/legend_colors.py fig.png`），见各自 `--help`。
 
 📦 批量产出：
@@ -207,6 +223,7 @@ PDF ──→ 分诊 ──→ 图注↔图配对 ──→ [--want?] 按需求�
    - **重合并列 / 遮挡补全**：两条线画在一起时，压在下面的那条在重合段里**一个像素都没有**（图上只显示上面那条的颜色）。代码拿"另一条曲线真的画在那里"当证据，把断掉的那段沿它的轨迹补回来；补出来的点与实测点分开计数，写进报告（`补全 N 列（被「X」遮挡）`）并画在质检图上（橙色圆圈）。**没有笔画经过的长断口一律不补**——曲线本来就在那里结束时必须保持断开
    - **模型复盘（第二轮请教）**：追完之后，只要这个面板有"没追到的曲线 / 重复轨迹 / 长断口 / 数量与模型清单不符"，就把追出来的轨迹**编号画回原图**（`out/review/<面板>_review.png`），问模型三件事：哪两个编号是同一条（合并）、哪条追错了（丢掉）、漏了哪条（给锚点，代码照着补追）。正常面板不多花 token；回答留档在 `_review.json` 里可审计
    - **轴的数量级标注**：轴旁边写着 ×10⁻⁴ 这类乘数时，模型读出来、代码乘到数据上（报告里注明"数量级标注"），不再让 CSV 里出现"5.6 其实是 5.6×10⁻⁴"这种错
+   - **模板输出（`--template`）**：模型把模板编译成一段最简 `render(series, context)` 代码（无注释无打印），按模板内容 sha1 缓存；命中缓存就完全不调模型。代码只拿得到曲线数据 + 参数，渲染结果写到 `out/templates/<模板名>/`
 6. **矢量直读**：聚类矢量路径成图区域 → 找坐标框 → **用刻度线几何位置 + 刻度文字数值**拟合（文字包围盒有约 0.36pt 系统偏差，用刻度线可消除）→ 映射路径点。区域里没有可读刻度文字时（刻度是路径而非文字）不会直接判死：**有坐标框**就渲染成位图转交位图路线再试一次；覆盖整页、与已导出的位图重叠、或压根没有坐标框（页面线条/表格）的才跳过
 7. **VLM 辅助**：只做"小输出"任务（分类、轴读数、命名、抽查），不让模型搬运数据点
 
@@ -320,6 +337,8 @@ python vlm_client.py --check                     # 验证 + 列出可用模型
 - **闭合回线只提取可见的弧**：P-V 边界、喷雾边界那种一圈的曲线，被另一圈压住的部分目前补不了（掩膜碎成多块时按可见段出数据），报告里会标 `闭合回线` 并给出实际覆盖范围
 - **网格线的三道防线**：黑线路线最容易把背景网格当成曲线。现在挡了三层——横跨大半张图且几乎没有起伏、所在高度整幅图都有同一条线、40% 以上的点挤在同一行；仍然可能漏的（很淡的点状网格、极短的残段）会在报告里以"几乎水平的轨迹"出现，复盘轮也会看到并要求模型确认
 - **复盘轮要花 token**：只在有问题的面板上问一次（正常面板不问）。如果不想要这一轮，跑 `extract` 时不要传 `--vlm`；同一面板的复盘结果有缓存，重跑不重复计费
+- **模板代码是模型写的一次性代码**：缓存在 `.templates/<哈希>.json`（可直接打开看/改，改完删掉重跑即可重新生成）。它在只给白名单 `import` 的环境里执行，渲染失败只跳过模板输出、不影响 CSV。模板要的参数只能来自"图上看得见的东西"（图例/标题/标注/图注），读不到一律留空
+- **`--want` 的轴标题核对看不清时不删**：模型读不出轴标题（扫描图常见）时会保留该面板并标 `⚠️ 看不清（保留）`，需要你按质检图人工确认；要强制只保留核对通过的，可在报告里按 `axis_check` 手工 `run.py confirm --skip`
 
 ## 🩺 故障排查
 

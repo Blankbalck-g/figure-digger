@@ -26,10 +26,12 @@ AXIS_SYSTEM = "你是科研论文图表的读数助手，只输出 json。"
 
 AXIS_PROMPT = """读出这张图表坐标轴的刻度范围和刻度值，只输出 json。
 示例 json 输出：
-{{"x": {{"min": 0, "max": 5, "labels": ["0", "1", "2", "3", "4", "5"], "scale": "linear"}},
+{{"x": {{"min": 0, "max": 5, "labels": ["0", "1", "2", "3", "4", "5"], "scale": "linear",
+        "title": "Time after start of injection", "unit": "ms"}},
   "y_axes": [{{"side": "left", "min": 0, "max": 70, "labels": ["0", "10", "20", "30", "40", "50", "60", "70"],
-              "scale": "linear", "multiplier": 1e-4, "unit": "mm^3/mm^3",
+              "scale": "linear", "multiplier": 1e-4, "unit": "mm", "title": "Spray tip penetration",
               "multiplier_note": "轴标题左上角写着 ×10^-4"}}],
+  "matches_request": true, "match_note": "横轴是时间(ms)、纵轴是贯穿距(mm)，与需求一致",
   "confidence": 0.9, "note": ""}}
 字段要求：
 - min/max 是坐标框两端对应的数值（不是数据的最小最大值，是坐标轴的范围）
@@ -40,8 +42,15 @@ AXIS_PROMPT = """读出这张图表坐标轴的刻度范围和刻度值，只输
   （例如 ×10^-4 填 0.0001），没有填 1。这条决定最终数据的数值大小，请务必看清
   ——**注意区分是乘在 x 轴还是 y 轴**，分别填到对应的轴里
 - unit：轴标题里的单位文字（没有填 null）
+- **title**：轴标题文字（例如 "Time after start of injection"、"Spray tip penetration"），
+  **不带单位**；看不清填 null
 - **y_axes 是数组**：只有一个纵轴时放一个元素；若图中有左右两条纵轴，请放两个元素，
   分别用 "side": "left" / "right" 标明，并各自给出自己的 min/max/labels
+- **matches_request**：只有补充信息里给了"用户要的是什么图"时才判断——这张图的横轴/
+  纵轴是否**就是**用户要的？是填 true，不是填 false，看不清填 null。
+  要严格：用户要"贯穿距随时间变化"，则横轴必须是时间、纵轴必须是贯穿距；
+  横轴是曲轴转角、或纵轴是喷雾锥角/动量通量的都算 false
+- match_note：一句话说明依据（横轴是…、纵轴是…，所以符合/不符合）
 {hint}
 只依据图像内容填写；不确定时把 confidence 调低，不要编造数字。"""
 
@@ -143,7 +152,8 @@ def classify_chart(vlm, image_path):
 
 
 def read_axis_ranges(vlm, image_path, hint=None):
-    h = f"OCR 的初步读数是：{hint}。请核对并纠正。" if hint else "图中没有其他辅助信息。"
+    h = f"补充信息：{hint}" if hint else \
+        "补充信息：没有（不用判断 matches_request，填 null）"
     data, raw = vlm.ask_json(image_path, AXIS_PROMPT.format(hint=h), system=AXIS_SYSTEM)
     data["_raw"] = raw
     return data

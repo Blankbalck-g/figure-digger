@@ -377,8 +377,21 @@ def log_stats(path=LOG_PATH, model=None):
 def mock_response(prompt):
     """Canned replies so the plumbing can be tested without a key."""
     p = prompt.lower()
+    # 模板编译（把用户给的格式编译成 render 代码；只调一次，之后走本地缓存）
+    if "render(series, context)" in p or "数据契约" in p:
+        code = ("def render(series, context):\n"
+                "    out={}\n"
+                "    for s in series:\n"
+                "        lines=['# '+context['panel'], '# fuel='+s['params'].get('fuel','')]\n"
+                "        lines+=[str(x)+'\\t'+str(y) for x,y in zip(s['x'],s['y'])]\n"
+                "        out[s['name']+context['ext']]='\\n'.join(lines)+'\\n'\n"
+                "    return out")
+        return json.dumps({"ext": ".dat", "params": ["fuel"], "code": code})
+    # 每条曲线的参数（模板要求标注参数时才问）
+    if "params" in p and "曲线" in p:
+        return json.dumps({"params": {"Heatedtip": {"fuel": "MeOH"}}})
     # 复盘（识别出来的曲线编号画回图上，让模型核对数量/归属）
-    if "编号" in p or "merge" in p:
+    if "merge" in p and "drop" in p:
         return json.dumps({"merge": [], "drop": [], "add": [], "ok": True,
                            "note": "mock：编号与图例一一对应，没有多余或遗漏"})
     # 曲线定位（模型自己找出数据曲线 + 锚点）
@@ -427,9 +440,11 @@ def mock_response(prompt):
     if "axis" in p or "tick" in p or "刻度范围" in p:
         return json.dumps({
             "x": {"min": 0, "max": 5, "labels": ["0", "1", "2", "3", "4", "5"],
-                  "scale": "linear"},
-            "y": {"min": 0, "max": 70, "labels": ["0", "10", "20", "30", "40", "50", "60", "70"],
-                  "scale": "linear"},
+                  "scale": "linear", "title": "Time after start of injection", "unit": "ms"},
+            "y_axes": [{"side": "left", "min": 0, "max": 70,
+                        "labels": ["0", "10", "20", "30", "40", "50", "60", "70"],
+                        "scale": "linear", "title": "Spray tip penetration", "unit": "mm"}],
+            "matches_request": True, "match_note": "mock：横轴是时间、纵轴是贯穿距",
             "confidence": 0.95,
         })
     if "legend" in p or "series name" in p or "图例" in p:

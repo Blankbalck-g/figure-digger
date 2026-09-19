@@ -14,6 +14,8 @@ import threading
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 
+import numpy as np
+
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "dig"))
@@ -62,8 +64,9 @@ def main():
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     vlm = vc.DeepSeekVLM(api_key="sk-mock",
                          base_url=f"http://127.0.0.1:{srv.server_address[1]}")
-    panel_dir = ROOT / "out" / "2026-01-0340" / "panels"
-    panel_img = next(panel_dir.glob("*.png"))
+    import imgio as iio  # noqa: E402  （测试用：自造一张面板图，不依赖任何运行产物）
+    panel_img = tmp / "panel.png"
+    iio.imwrite(panel_img, np.full((320, 480, 3), 255, np.uint8))
     panel = {"id": "test_panel", "frame": [0, 0, 100, 100]}
     answer = R.revise_panel(vlm, panel_img, panel, [{"label": "A"}],
                             [_entry("A", _trace(100)), _entry("B", _trace(300))],

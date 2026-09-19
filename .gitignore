@@ -15,6 +15,7 @@ papers/
 # 缓存与日志
 .vlm_cache/
 .vlm_log.jsonl
+.templates/
 __pycache__/
 *.pyc
 

@@ -1079,3 +1079,35 @@ def collapse_plateaus(trace, tol=1.0, min_run=3, min_keep=20):
             run = [(x, y)]
     flush()
     return out if len(out) >= min(min_keep, len(pts)) else list(trace)
+
+
+def bridge_through_anchors(trace, anchors, min_gap=3.0):
+    """把模型给的锚点插进轨迹的缺口里（按 x 排序，线性连到两侧的实测点）。
+
+    用于"重合处只显示一种颜色、下面那条追断了"的补全：颜色追踪只能证明"别的笔画压在
+    这里"，而模型能读出这条线在被压住的那一段往哪走。锚点只往**已有缺口**里插，不会
+    改变已经追到的部分。
+    """
+    pts = sorted((float(x), float(y)) for x, y in trace)
+    add = sorted((float(x), float(y)) for x, y in (anchors or []))
+    if not pts or not add:
+        return list(trace)
+    # 缺口在两头（曲线起点之前 / 终点之后，重合处最常见）时，锚点要接到两端外面
+    out = [a for a in add if a[0] < pts[0][0] - 1.0]
+    tail = [a for a in add if a[0] > pts[-1][0] + 1.0]
+    ai = 0
+    for i, (x, y) in enumerate(pts):
+        out.append((x, y))
+        if i + 1 >= len(pts):
+            break
+        nx = pts[i + 1][0]
+        if nx - x < min_gap:
+            continue
+        while ai < len(add) and add[ai][0] <= x:
+            ai += 1
+        j = ai
+        while j < len(add) and add[j][0] < nx:
+            out.append(add[j])
+            j += 1
+    out.extend(tail)
+    return out

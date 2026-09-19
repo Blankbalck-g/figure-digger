@@ -126,6 +126,18 @@ def main():
     ok = len(ss.collapse_plateaus(line)) == len(line)
     bad += 0 if ok else 1
     print(f"  [{'OK ' if ok else 'FAIL'}] 普通斜线不受影响：{len(line)} 点保持 {len(line)} 点")
+    # 模型补锚点：缺口在两头（重合处最常见）和中间都要能插进去
+    trace = [(float(x), 200.0 - x * 0.1) for x in range(200, 400, 5)]
+    head = [(float(x), 215.0 - x * 0.05) for x in (120, 150, 180)]
+    inner = [(310.0, 165.0), (320.0, 163.0)]
+    tail = [(420.0, 155.0), (450.0, 152.0)]
+    got = ss.bridge_through_anchors(trace, head + inner + tail)
+    xs = [x for x, _ in got]
+    ok = (min(xs) == 120 and max(xs) == 450
+          and all(any(abs(x - a) < 0.5 for x, _ in got) for a in (310.0, 320.0)))
+    bad += 0 if ok else 1
+    print(f"  [{'OK ' if ok else 'FAIL'}] 模型锚点插缺口：{len(trace)} -> {len(got)} 点，"
+          f"x=[{min(xs):.0f},{max(xs):.0f}]（两头+中间都插上了）")
     print("通过" if not bad else f"{bad} 项不符合预期")
     return 1 if bad else 0
 

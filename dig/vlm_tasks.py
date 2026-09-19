@@ -364,3 +364,28 @@ def axis_tolerance(axis_range, tick_step, min_frac=0.02, tick_frac=0.6):
     if tick_step and tick_step > 0:
         tol = max(tol, tick_frac * abs(tick_step))
     return round(tol, 6)
+
+
+GAP_SYSTEM = "你是科研论文图表的读图助手，只输出 json。"
+
+# 曲线被压住的那一段：颜色追踪到这里就断了（重合处只显示上面那条的颜色）。把这一小块
+# 裁剪图交给模型，让它沿着两侧可见的走向说出这段的锚点——读图用它的能力，像素归代码。
+GAP_PROMPT = """这张裁剪图来自一篇论文的曲线图。曲线「{label}」在{where}有一段没被识别出来，
+可能被别的曲线压住、被图例/文字/阴影盖住。请沿着这条曲线的走向给出这段里的 2~3 个锚点：
+{{"anchors": [[x, y], [x, y]], "note": "一句话"}}
+要求：
+- x、y 是**相对这张裁剪图**的归一化坐标（左上角 0,0，右下角 1,1）
+- 锚点必须落在这条曲线该段的走向上（用两侧可见的部分推它的走势）
+- 图里已识别的部分画成{color}线，灰色是别的曲线（用它判断这条线是不是贴着它走）
+- 看不出走势就填空数组，**不要编**
+可见端点/已知信息：{info}"""
+
+
+def gap_anchors(vlm, crop_path, label, color, info=""):
+    """让模型给"被盖住那一段"的锚点 -> {"anchors": [[x,y],...], "note": ...}。"""
+    prompt = GAP_PROMPT.format(label=label or "该曲线", color=color or "彩色",
+                               where="图中间", info=info or "（无）")
+    data, raw = vlm.ask_json(crop_path, prompt, system=GAP_SYSTEM, retries=1,
+                             max_tokens=400)
+    data["_raw"] = raw
+    return data

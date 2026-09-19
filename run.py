@@ -273,6 +273,115 @@ def _extract_panel(panel, panel_path, rng, csv_dir, vlm=None):
         return None
 
 
+def _gap_crop(img, trace, x0, x1, others, color, out_path):
+    """裁出缺口那一小块，并把"已识别部分"画上去，给模型看走势。"""
+    h, w = img.shape[:2]
+    pad_x = max(12, int(0.03 * w))
+    cx0, cx1 = max(0, int(x0 - pad_x)), min(w, int(x1 + pad_x))
+    ys = [y for x, y in trace if cx0 <= x <= cx1]
+    for _n, t in others:
+        ys += [y for x, y in t if cx0 <= x <= cx1]
+    if not ys:
+        ys = [y for _x, y in trace]
+    pad_y = max(14, int(0.25 * (max(ys) - min(ys) + 1)))
+    cy0, cy1 = max(0, int(min(ys) - pad_y)), min(h, int(max(ys) + pad_y))
+    if cx1 - cx0 < 12 or cy1 - cy0 < 12:
+        return None
+    crop = img[cy0:cy1, cx0:cx1].copy()
+    for _n, t in others:                       # 别的曲线：灰
+        pts = [(int(x - cx0), int(y - cy0)) for x, y in t if cx0 <= x < cx1]
+        if len(pts) > 1:
+            cv2.polylines(crop, [np.array(pts, np.int32)], False, (150, 150, 150), 1)
+    pts = [(int(x - cx0), int(y - cy0)) for x, y in trace if cx0 <= x < cx1]
+    if len(pts) > 1:                           # 已识别的部分：本色
+        cv2.polylines(crop, [np.array(pts, np.int32)], False, color, 2, cv2.LINE_AA)
+    iio.imwrite(out_path, crop)
+    return (cx0, cy0, cx1, cy1)
+
+
+def _repair_gaps(vlm, panel, panel_path, picks, names, outdir, log, max_calls=4):
+    """重合处只显示一种颜色 -> 追断的那几段：让模型给锚点，代码插回去。
+
+    只在"这条曲线明显比别人短 / 中间有长断口"时才问，每次只裁那一小块。模型读图、说锚点；
+    锚点只往已有缺口里插，已经追到的部分不动（想编也编不进去）。
+    """
+    import series_seed as ss
+    usable = [p for p in picks if p["trace"] and p["kind"] != "loop"]
+    if vlm is None or len(usable) < 2:
+        return 0
+    img = iio.imread(panel_path)
+    if img is None:
+        return 0
+    h, w = img.shape[:2]
+    allx = [x for p in usable for x, _y in p["trace"]]
+    lo, hi = min(allx), max(allx)
+    if hi - lo < 0.25 * w:
+        return 0
+    calls, added = 0, 0
+    shot_dir = Path(outdir) / "gaps"
+    shot_dir.mkdir(parents=True, exist_ok=True)
+    for p in sorted(usable, key=lambda q: -len(q["trace"])):
+        if calls >= max_calls:
+            break
+        xs = [x for x, _y in p["trace"]]
+        windows = []
+        if min(xs) - lo > 0.05 * w:
+            windows.append((lo, min(xs)))
+        if hi - max(xs) > 0.05 * w:
+            windows.append((max(xs), hi))
+        for gap in ((p["completion"] or {}).get("open_gaps") or []):
+            if gap["cols"] > 0.04 * w:
+                windows.append((gap["x0"], gap["x1"]))
+        for x0, x1 in windows[:2]:
+            if calls >= max_calls or x1 - x0 < 0.04 * w:
+                continue
+            label = str(p["s"].get("label") or "曲线")
+            color = (p["color"] or (0, 0, 0)) if not p["dark"] else (60, 60, 60)
+            others = [(names[j], q["trace"]) for j, q in enumerate(picks) if q is not p
+                      and q["trace"] and q["kind"] != "loop"]
+            safe = ss.safe_tag(label)
+            crop_path = shot_dir / f"{panel['id']}_{safe}_{int(x0)}_{int(x1)}.png"
+            box = _gap_crop(img, p["trace"], x0, x1, others, color, crop_path)
+            if box is None:
+                continue
+            calls += 1
+            try:
+                data = vt.gap_anchors(
+                    vlm, crop_path, label,
+                    "#%02x%02x%02x" % (color[2], color[1], color[0]),
+                    info=(f"缺口在整张图的 x={int(x0)}~{int(x1)} 像素（图宽 {w}）"))
+            except Exception as exc:  # noqa: BLE001
+                log(f"      （补缺口调用失败：{type(exc).__name__}: {exc}）")
+                continue
+            cx0, cy0, cx1, cy1 = box
+            got = []
+            for a in (data.get("anchors") or []):
+                try:
+                    ax, ay = float(a[0]), float(a[1])
+                except (TypeError, ValueError, IndexError):
+                    continue
+                if not (0.0 <= ax <= 1.0 and 0.0 <= ay <= 1.0):
+                    continue
+                px = cx0 + ax * (cx1 - cx0)
+                py = cy0 + ay * (cy1 - cy0)
+                if x0 - 4 <= px <= x1 + 4:
+                    got.append((px, py))
+            if not got:
+                continue
+            merged = ss.bridge_through_anchors(p["trace"], got)
+            n_add = len(merged) - len(p["trace"])
+            if n_add > 0:
+                added += n_add
+                p["completion"] = dict(p["completion"] or {})
+                p["completion"]["model_anchors"] = {
+                    "cols": n_add,
+                    "by": f"模型读图补的锚点（{len(got)} 个，x={int(x0)}~{int(x1)}）"}
+                p["trace"] = merged
+                log(f"      模型补缺口：{label} x={int(x0)}~{int(x1)}，"
+                    f"插了 {len(got)} 个锚点（+{n_add} 列）")
+    return added
+
+
 def _spec_dark(s, color):
     """模型说这条线是黑色/深灰（或它给的颜色本身就是深灰）。
 
@@ -554,6 +663,10 @@ def _extract_seeded(panel, panel_path, rng, csv_dir, spec, vlm=None):
         elif cinfo:
             p["completion"] = cinfo
 
+    # 还有没补上的缺口（重合处只显示一种颜色、压在下面的追断了）-> 让模型读图给锚点
+    if vlm is not None:
+        _repair_gaps(vlm, panel, panel_path, picks, names, Path(csv_dir).parent, log)
+
     def build_entry(p):
         """一条 pick -> 待落盘的 entry（数据先在内存里，复盘后统一写文件）。"""
         s, trace, kind, info = p["s"], p["trace"], p["kind"], p["info"]
@@ -732,12 +845,16 @@ def jsonable_completion(cinfo):
     """补全信息进 config/report 前瘦身（只留计数与前几段，避免 JSON 膨胀）。"""
     if not cinfo:
         return None
-    return {"bridged_cols": int(cinfo.get("bridged_cols") or 0),
+    out = {"bridged_cols": int(cinfo.get("bridged_cols") or 0),
             "filled": int(cinfo.get("filled") or 0),
             "spans": [{"x0": int(s["x0"]), "x1": int(s["x1"]), "cols": int(s["cols"]),
                        "by": str(s.get("by"))} for s in (cinfo.get("spans") or [])[:8]],
             "open_gaps": [{"x0": int(s["x0"]), "x1": int(s["x1"]), "cols": int(s["cols"])}
                           for s in (cinfo.get("open_gaps") or [])[:8]]}
+    if cinfo.get("model_anchors"):
+        ma = cinfo["model_anchors"]
+        out["model_anchors"] = {"cols": int(ma.get("cols") or 0), "by": str(ma.get("by"))}
+    return out
 
 
 def series_y_from(panel):
@@ -1498,6 +1615,9 @@ def write_report(config, path, phase, results=None):
                     cols = sum(int(x["cols"]) for x in comp["open_gaps"])
                     extra.append(f"⚠️ {len(comp['open_gaps'])} 段长断口未补"
                                  f"（共 {cols} 列，没有别的笔画经过，保持断开）")
+                if comp.get("model_anchors"):
+                    extra.append(f"🧠 {comp['model_anchors'].get('by')}"
+                                 f"（+{comp['model_anchors'].get('cols')} 列）")
                 lines.append(f"  - `{s['file']}`  {s['points']} 点, "
                              f"y=[{s['y_range'][0]}, {s['y_range'][1]}]"
                              + ("（" + "；".join(extra) + "）" if extra else ""))
@@ -1553,18 +1673,43 @@ def _write_template_output(fmt, res, panel, panel_path, csv_dir, outdir, vlm, lo
                            "file": s["file"], "x": xs, "y": ys, "params": {}})
     if not series:
         return
-    if fmt.params:                      # 模板要参数 -> 模型读数、代码填空（读不到留空）
-        vals = tpl.ask_params(vlm, panel_path, panel.get("caption"), series, fmt.params)
-        for item in series:
-            item["params"] = {k: str((vals.get(item["name"]) or {}).get(k, ""))
-                              for k in fmt.params}
+    context = {"paper": panel_path.parent.parent.name, "panel": panel["id"],
+               "ext": fmt.ext, "template": fmt.name}
+    # 模板声明的参数 + 代码实际用到的参数（模型有时只列了"按曲线"的那部分，
+    # 模板里的工况块就被漏掉 -> 渲染 KeyError。让代码自己说它要什么）
+    keys = list(dict.fromkeys(fmt.params + tpl.probe_params(fmt, series, context)))
+    vals = {}
+    if keys:
+        vals = tpl.ask_params(vlm, panel_path, panel.get("caption"), series, keys,
+                             hints=tpl.params_hints(fmt, keys))
+    for item in series:
+        item["params"] = {k: str((vals.get(item["name"]) or {}).get(k, "")) for k in keys}
     try:
-        files = fmt.render(series, {"paper": panel_path.parent.parent.name,
-                                    "panel": panel["id"], "ext": fmt.ext,
-                                    "template": fmt.name}) or {}
+        files = fmt.render(series, context) or {}
     except Exception as exc:  # noqa: BLE001 - 模板坏了不该拖垮提取
-        log(f"      （模板渲染失败，跳过：{type(exc).__name__}: {exc}）")
-        return
+        # 模板里写的是 %.E 这类数值格式，而模型读回来的是字符串 -> 能转数字的转数字，
+        # 没读到的填空串会报错，就退成 0，再试一次（绝不因为参数格式把整份输出丢掉）
+        coerced, blanked = 0, 0
+        for item in series:
+            fixed = {}
+            for k, v in item["params"].items():
+                if v == "":
+                    fixed[k], blanked = 0.0, blanked + 1
+                    continue
+                try:
+                    fixed[k] = float(str(v).strip())
+                    coerced += 1
+                except (TypeError, ValueError):
+                    fixed[k] = v
+            item["params"] = fixed
+        try:
+            files = fmt.render(series, context) or {}
+            log(f"      （模板要数值：{coerced} 个参数转成数字"
+                + (f"，{blanked} 个没读到按 0 填" if blanked else "")
+                + "，渲染继续）")
+        except Exception as exc2:  # noqa: BLE001
+            log(f"      （模板渲染失败，跳过：{type(exc2).__name__}: {exc2}）")
+            return
     dest = Path(outdir) / "templates" / Path(str(fmt.name)).stem
     for fname, text in files.items():
         p = dest / Path(str(fname)).name               # 只取文件名，防目录穿越

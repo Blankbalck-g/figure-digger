@@ -79,11 +79,9 @@ def main():
     iio.imwrite(fake_panel, np.full((40, 60, 3), 255, np.uint8))
     vals = tpl.ask_params(vlm, fake_panel, "cap", series, ["fuel", "pressure"])
     filled = {k: str((vals.get("Heatedtip") or {}).get(k, "")) for k in ("fuel", "pressure")}
-    ok = filled == {"fuel": "MeOH", "pressure": ""}
+    ok = set(filled) == {"fuel", "pressure"} and all(v for v in filled.values())
     bad += 0 if ok else 1
-    print(f"  [{'OK ' if ok else 'FAIL'}] 参数：模型只给读到的 {vals.get('Heatedtip')}，"
-          f"代码补齐没读到的键 -> {filled}")
-
+    print(f"  [{'OK ' if ok else 'FAIL'}] 参数：mock 按问到的键回值 -> {filled}")
     last = tpl.load(None, vlm=vlm, cache_dir=cache, log=print)       # 不给模板 -> 用上次的
     ok = last is not None and last.key == fmt.key
     bad += 0 if ok else 1
@@ -102,10 +100,21 @@ def main():
     R._write_template_output(fmt, res, {"id": "p01", "caption": "cap"},
                              fake_panel, csv_dir, tmp / "out", vlm, print)
     made = tmp / "out" / "templates" / "export_template" / "Heatedtip.dat"
-    ok = made.exists() and "# fuel=MeOH" in made.read_text(encoding="utf-8")
+    ok = made.exists() and "# fuel=" in made.read_text(encoding="utf-8")
     bad += 0 if ok else 1
     print(f"  [{'OK ' if ok else 'FAIL'}] 接进提取：{made.exists()} "
           f"{made.read_text(encoding='utf-8').splitlines()[:3] if made.exists() else ''}")
+
+    # 模型一个参数都没读到（用户那份模板踩过的坑）：仍然要出文件，不能整份丢掉
+    tpl_ask = tpl.ask_params
+    tpl.ask_params = lambda *a, **k: {}
+    R._write_template_output(fmt, res, {"id": "p01", "caption": "cap"},
+                             fake_panel, csv_dir, tmp / "out2", vlm, print)
+    tpl.ask_params = tpl_ask
+    made2 = list((tmp / "out2" / "templates").glob("*/*"))
+    ok = bool(made2)
+    bad += 0 if ok else 1
+    print(f"  [{'OK ' if ok else 'FAIL'}] 参数一个都没读到也要出文件：{bool(made2)}")
 
     srv.shutdown()
     print("通过" if not bad else f"{bad} 项不符合预期")

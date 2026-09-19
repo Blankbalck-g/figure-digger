@@ -33,7 +33,9 @@ TEMPLATE_PROMPT = """把一个数据模板编译成渲染代码，只输出 json
 要求：
 - 代码最短、**不要注释、不要 print、不要多余 import**（标准库够用）
 - 模板里的固定文字、分隔符、换行原样保留
-- params 列出模板要求按曲线标注的参数名；没有就填 []
+- **params 必须列出模板里所有"要填值"的字段名**（不只是每条曲线的：工况、压力、温度、
+  燃料、文件名、时间…凡是模型要读出来填进去的都算）。列不全，渲染时会 KeyError
+- 代码里用 s['params']['字段名'] 取值；读不到的字段由调用方填空/0
 - 模板里的重复段按模板出现的形式渲染每条曲线
 - 只输出 json，不要解释
 模板内容：
@@ -47,7 +49,11 @@ PARAMS_PROMPT = """这张图是「{caption}」，图里的曲线有：{names}。
 模板要求每条曲线标注这些参数：{keys}。
 请从图上的图例、标题、工况标注（必要时参考文件名/图注）读出每条曲线对应的参数值，只输出 json：
 {{"params": {{"曲线名": {{"参数名": "值"}}}}}}
-要求：读不到就填空字符串 ""，**不要猜、不要编造**；数值/单位照图上的写法。"""
+要求：
+- 参数名后面若附了"模板里的写法"（通常带单位），请按**模板要的单位**给数值，
+  必要时换算（例如 1 bar = 1e6 dyn/cm^2，298 K 就写 298）
+- 图上标的是整张图的工况（不是某条曲线的），每条曲线都填同一个值
+- 读不到就填空字符串 ""，**不要猜、不要编造**"""
 
 
 class Format:
@@ -58,7 +64,31 @@ class Format:
         self.ext = str(data.get("ext") or ".txt")
         self.params = [str(k) for k in (data.get("params") or [])]
         self.code = str(data.get("code") or "")
+        self.text = str(data.get("text") or "")
         self.render = _compile(self.code)
+
+
+def probe_params(fmt, series, context):
+    """空跑一遍 render，返回代码实际用到的参数键（模板声明的 params 可能不全）。
+
+    实测：模板里明明有 `Prediction Input:` 那 8 个字段，模型给的 params 却是空的
+    （它以为只要列"按曲线"的参数），于是渲染 `KeyError` 直接跳过、用户什么都拿不到。
+    这里先让它要什么自己记下来，再去问模型要值。
+    """
+    missing = []
+
+    class Probe(dict):
+        def __missing__(self, key):
+            missing.append(str(key))
+            return 0.0
+
+    probe = [{"name": s["name"], "x": s.get("x") or [], "y": s.get("y") or [],
+              "params": Probe()} for s in series]
+    try:
+        fmt.render(probe, context)
+    except Exception:  # noqa: BLE001 - 探针失败不影响：能拿到多少键算多少
+        pass
+    return list(dict.fromkeys(missing))
 
 
 def _compile(code):
@@ -105,6 +135,13 @@ def load(template=None, vlm=None, cache_dir=None, log=None):
     path = cache / f"{key}.json"
     if path.exists():                                      # 模板没变 -> 不写代码
         data = json.loads(path.read_text(encoding="utf-8"))
+        if not data.get("text"):                           # 老缓存没存原文：补上（单位提示要用）
+            try:
+                data["text"] = Path(template).read_text(encoding="utf-8", errors="replace")
+                path.write_text(json.dumps(data, ensure_ascii=False, indent=1),
+                                encoding="utf-8")
+            except OSError:
+                pass
         if log:
             log(f"      模板未变，复用已有实现：{Path(template).name}（0 token）")
     else:
@@ -113,6 +150,7 @@ def load(template=None, vlm=None, cache_dir=None, log=None):
         prompt = TEMPLATE_PROMPT.format(template=text[:12000])
         data, _raw = vlm.ask_json(None, prompt, system=TEMPLATE_SYSTEM, max_tokens=2000)
         data["template"] = Path(template).name
+        data["text"] = text
         cache.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
         if log:
@@ -122,14 +160,35 @@ def load(template=None, vlm=None, cache_dir=None, log=None):
     return Format(key, Path(template).name, data)
 
 
-def ask_params(vlm, image_path, caption, series, keys):
+def params_hints(fmt, keys):
+    """从模板原文里给每个参数名找一行上下文（带单位），读数值时有用。
+
+    例：模板写着 `ambient_pressure (dyn/cm2) : 0`，图上是 "P_amb = 20 bar"，
+    模型看到单位才知道要换算。
+    """
+    lines = [ln.strip() for ln in (fmt.text or "").splitlines() if ln.strip()]
+    out = {}
+    for k in keys:
+        name = str(k)
+        for ln in lines:
+            if name in ln or name.replace("_", " ") in ln.lower():
+                # 只留"字段名 + 单位"，模板里自带的示例值不要给模型看（免得照抄）
+                out[name] = ln.split(":")[0].split("=")[0].strip()[:60]
+                break
+    return out
+
+
+def ask_params(vlm, image_path, caption, series, keys, hints=None):
     """让模型读每条曲线的参数值。读不到填空字符串；没有 VLM 就全空。"""
     out = {s["name"]: {} for s in series}
     if not keys or vlm is None:
         return out
     names = "、".join(str(s["name"]) for s in series)
+    keys_text = "、".join(
+        (f"{k}（模板里的写法：{hints[k]}）" if hints and k in hints else str(k))
+        for k in keys)
     prompt = PARAMS_PROMPT.format(caption=(caption or "（无图注）")[:200], names=names,
-                                  keys="、".join(str(k) for k in keys))
+                                  keys=keys_text)
     try:
         data, _raw = vlm.ask_json(image_path, prompt, system=PARAMS_SYSTEM, max_tokens=600)
     except Exception:  # noqa: BLE001 - 参数读不到不影响数据本身

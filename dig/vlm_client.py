@@ -21,6 +21,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import sys
 import time
 import urllib.error
@@ -387,9 +388,21 @@ def mock_response(prompt):
                 "        out[s['name']+context['ext']]='\\n'.join(lines)+'\\n'\n"
                 "    return out")
         return json.dumps({"ext": ".dat", "params": ["fuel"], "code": code})
-    # 每条曲线的参数（模板要求标注参数时才问）
-    if "params" in p and "曲线" in p:
-        return json.dumps({"params": {"Heatedtip": {"fuel": "MeOH"}}})
+    # 曲线的参数（模板要求标注参数时才问）：按提示词里问到的曲线名与参数名原样回一份
+    if "params" in p and "曲线有" in p:
+        m = re.search(r"曲线有：(.+?)。", prompt)
+        names = [x.strip() for x in (m.group(1).split("、") if m else []) if x.strip()]
+        m2 = re.search(r"标注这些参数：(.+?)。", prompt, re.S)
+        keys = []
+        if m2:
+            for part in m2.group(1).split("、"):
+                keys.append(re.split(r"[（(]", part.strip())[0].strip())
+        return json.dumps({"params": {n: {k: "1.5e-2" for k in keys if k}
+                                      for n in names}})
+    # 补缺口：曲线被压住那一段的锚点（裁剪图里的归一化坐标）
+    if "锚点" in p and "裁剪图" in p:
+        return json.dumps({"anchors": [[0.3, 0.55], [0.5, 0.5], [0.7, 0.45]],
+                           "note": "mock：沿两侧可见走向补的锚点"})
     # 复盘（识别出来的曲线编号画回图上，让模型核对数量/归属）
     if "merge" in p and "drop" in p:
         return json.dumps({"merge": [], "drop": [], "add": [], "ok": True,

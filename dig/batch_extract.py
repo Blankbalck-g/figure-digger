@@ -341,13 +341,32 @@ def _frame_of(gray, frame_hint=None):
     discarded by design, (b) a cropped vector chart has no long enough dark run for
     `find_frame`. When the caller already knows the box (from the PDF itself) there is
     no reason to give up on it.
+
+    第三种实测情形（2023-01-1635 图 4）：图上有一圈**图幅外框**，`find_frame` 会挑它，
+    而配置里的坐标框正好在外框里面一圈——于是 `inner_boxes` 把整个绘图区当成"内嵌框"
+    排除掉，一条曲线都提不出来。判据很简单：配置框**严格落在**检出框里面时，配置框才是
+    坐标框。
     """
     try:
-        return el.find_frame(gray)
+        det = el.find_frame(gray)
     except RuntimeError:
-        pass
+        det = None
+    hint = None
+    if frame_hint:
+        h, w = gray.shape[:2]
+        if 0 <= frame_hint[0] < frame_hint[2] <= w and 0 <= frame_hint[1] < frame_hint[3] <= h:
+            hint = tuple(int(v) for v in frame_hint)
+    if det is not None:
+        if hint and (det[0] < hint[0] and det[1] < hint[1]
+                     and det[2] > hint[2] and det[3] > hint[3]):
+            return hint                                # 检出的是图幅外框，配置框才是坐标框
+        return det
     try:
-        return el.find_frame(gray, edge_frac=0.0)     # (a)
+        det = el.find_frame(gray, edge_frac=0.0)      # (a)
+        if hint and (det[0] < hint[0] and det[1] < hint[1]
+                     and det[2] > hint[2] and det[3] > hint[3]):
+            return hint
+        return det
     except RuntimeError:
         pass
     h, w = gray.shape[:2]

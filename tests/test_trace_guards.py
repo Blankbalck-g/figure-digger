@@ -113,6 +113,19 @@ def main():
         bad += 0 if ok else 1
         print(f"  [{'OK ' if ok else 'FAIL'}] {name:16s} -> 水平段占比 {frac:.2f}"
               f"（判为网格={got}，期望 {want}）")
+    # 散点图的"阶梯"：标记符号宽十几像素，逐列追踪在它上面走平 —— 压成一个点
+    step = []
+    for i, (mx, my) in enumerate(zip(range(100, 400, 12), range(300, 200, -5))):
+        step += [(float(mx + dx), float(my)) for dx in range(12)]
+    collapsed = ss.collapse_plateaus(step)
+    ok = len(collapsed) <= len(step) // 8
+    bad += 0 if ok else 1
+    print(f"  [{'OK ' if ok else 'FAIL'}] 标记阶梯：{len(step)} 点 -> {len(collapsed)} 点"
+          f"（每个标记一个值）")
+    line = [(float(x), 300 - x * 0.3) for x in range(100, 400)]
+    ok = len(ss.collapse_plateaus(line)) == len(line)
+    bad += 0 if ok else 1
+    print(f"  [{'OK ' if ok else 'FAIL'}] 普通斜线不受影响：{len(line)} 点保持 {len(line)} 点")
     print("通过" if not bad else f"{bad} 项不符合预期")
     return 1 if bad else 0
 

@@ -327,6 +327,20 @@ def _spec_has_markers(s):
     return ls in ("marker", "markers", "scatter")
 
 
+def _markers_cover_curve(markers, trace, min_n=5, cover=0.6):
+    """这条曲线是不是"就是这些标记点连起来的"——标记够多、且铺满曲线的横向范围。
+
+    实测（2023-01-1635 图 4 那种散点图）：每个圆点宽十几像素，逐列追踪会在它上面走出
+    一条水平段，画出来就是明显的**阶梯**。标记中心才是真正的数据点，一个点一个值。
+    """
+    if not markers or len(markers) < min_n or len(trace) < 20:
+        return False
+    mx = [float(m[0]) for m in markers]
+    tx = [float(q[0]) for q in trace]
+    span_t, span_m = max(tx) - min(tx), max(mx) - min(mx)
+    return span_t > 0 and span_m >= cover * span_t
+
+
 REVIEW_COLORS = [(0, 0, 255), (0, 170, 0), (255, 0, 0), (0, 150, 255),
                  (255, 0, 190), (110, 60, 0), (0, 90, 255), (170, 0, 170)]
 
@@ -557,12 +571,29 @@ def _extract_seeded(panel, panel_path, rng, csv_dir, spec, vlm=None):
                      else el.color_mask(hsv, (0, 0, width - 1, height - 1), p["color"], 12))
             markers = ss.markers_in_mask(mmask, trace)
         note_draw = None
+        marker_line = False
         if markers:
             trace = ss.snap_line_to_markers(trace, markers)      # 标记处别走平台
+        if _markers_cover_curve(markers, trace):
+            # 散点图：标记中心就是数据。用"标记中心连线"替掉逐列追出来的线，
+            # 阶梯消失，每个点对应一个值（线是点连出来的，不额外损失信息）
+            centers = ss.line_through_markers(markers)
+            if len(centers) >= 3:
+                trace = centers
+                # 一个标记一个点：散点图上十几个点就是完整数据，不能再按"线要 20 点"砍
+                marker_line = True
+                note_draw = f"按标记中心出数据（{len(centers)} 个点），消除标记造成的阶梯"
+        elif _spec_has_markers(s):
+            # 标记检测不全（点太密/连成串）时退一步：把逐列追踪留下的"平台"压成一个点，
+            # 平台正是每个标记的宽度造成的阶梯
+            flat = ss.collapse_plateaus(trace)
+            if len(flat) < len(trace):
+                note_draw = f"标记处的平台已压缩（{len(trace)} -> {len(flat)} 点），消除阶梯"
+                trace = flat
         if str(s.get("draw") or "").lower() == "markers_connected" and len(markers) >= 3:
             trace = ss.line_through_markers(markers)             # 点即曲线
             want = "points"
-            note_draw = "散点用折线连起来：点即曲线（不再另出线文件）"
+            note_draw = note_draw or "散点用折线连起来：点即曲线（不再另出线文件）"
         elif want == "points" and len(markers) < 3:
             want = "line"
             note_draw = "模型说这条带标记，但没检出标记符号，改出线轨迹"
@@ -570,7 +601,7 @@ def _extract_seeded(panel, panel_path, rng, csv_dir, spec, vlm=None):
         point_data = el.to_data(markers, frame, xmin, xmax, ymin, ymax)
         return {"p": p, "want": want, "markers": markers, "line_data": line_data,
                 "point_data": point_data, "note_dup": None, "note_draw": note_draw,
-                "span": span}, None
+                "marker_line": marker_line, "span": span}, None
 
     # ---- 第三遍：定去留 + 合并重复轨迹 ----
     # 同一根线被模型拆成两条（甚至四条）上报是实测最常见的错法：63 个面板里出现
@@ -651,7 +682,8 @@ def _extract_seeded(panel, panel_path, rng, csv_dir, spec, vlm=None):
             name = ss.unique_path(csv_dir, f"{panel_path.stem}_{label}.csv")
             ss.write_csv(name, entry["point_data"])
             emitted.append(("points", name))
-        if want in ("line", "both") and len(entry["line_data"]) >= 20:
+        min_line = 3 if entry.get("marker_line") else 20   # 散点图：一个点一个值
+        if want in ("line", "both") and len(entry["line_data"]) >= min_line:
             suffix = "_line" if emitted else ""
             name = ss.unique_path(csv_dir, f"{panel_path.stem}_{label}{suffix}.csv")
             ss.write_csv(name, entry["line_data"])

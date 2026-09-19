@@ -1049,3 +1049,33 @@ def snap_line_to_markers(trace, markers, half_w=7.0):
                 best = (d, my_)
         out.append((x, best[1] if best else float(y)))
     return out
+
+
+def collapse_plateaus(trace, tol=1.0, min_run=3, min_keep=20):
+    """把标记符号撑出来的"平台"压成一个点：连续同高(±tol)的一段只留中间那个。
+
+    散点图的每个标记宽十几像素，逐列追踪在它上面走平，画出来就是**阶梯**（实测
+    2023-01-1635 图 4：一条曲线 683 行里有 38 段平台、190 个点落在平台上）。
+    只在模型说"这条带标记"时用——实心数据线的水平段不能压。
+    压完太短（说明整条线基本是平的）就保持原样，交回调用方。
+    """
+    pts = sorted((float(x), float(y)) for x, y in trace)
+    out, run = [], []
+
+    def flush():
+        if not run:
+            return
+        if len(run) >= min_run:
+            mid = run[len(run) // 2]
+            out.append(mid)
+        else:
+            out.extend(run)
+
+    for x, y in pts:
+        if run and abs(y - run[-1][1]) <= tol:
+            run.append((x, y))
+        else:
+            flush()
+            run = [(x, y)]
+    flush()
+    return out if len(out) >= min(min_keep, len(pts)) else list(trace)

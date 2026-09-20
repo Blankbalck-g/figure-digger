@@ -692,7 +692,13 @@ def _extract_seeded(panel, panel_path, rng, csv_dir, spec, vlm=None):
             # 阶梯消失，每个点对应一个值（线是点连出来的，不额外损失信息）
             centers = ss.line_through_markers(markers)
             if len(centers) >= 3:
-                trace = centers
+                # 标记范围**之外**的点要留着——那正是模型读图补的锚点（被压住的那一段
+                # 没有标记）。上一版直接用 centers 覆盖，把刚补好的缺口又抹掉了
+                # （实测 2024-01-3408 Diesel：补了锚点，CSV 的 x 范围却没变）。
+                mx0 = min(c[0] for c in centers)
+                mx1 = max(c[0] for c in centers)
+                kept = [(x, y) for x, y in trace if x < mx0 - 1.0 or x > mx1 + 1.0]
+                trace = sorted(kept + centers)
                 # 一个标记一个点：散点图上十几个点就是完整数据，不能再按"线要 20 点"砍
                 marker_line = True
                 note_draw = f"按标记中心出数据（{len(centers)} 个点），消除标记造成的阶梯"
@@ -991,6 +997,15 @@ def _record_axis_check(entry, va, want, log):
     if not want:
         return
     match, note = va.get("matches_request"), va.get("match_note")
+    note = str(note or "")
+    # "读不出标题"不等于"不符合"：模型有时因为图里没有轴标题就填 false，上一版据此把
+    # 面板整个跳过（实测 2026-01-0340 图 10 左图：横轴标题被裁掉，但确实是时间轴，
+    # 结果整张图一条数据都没出）。只有明确"轴是别的东西"才跳过。
+    if match is False and any(w in note for w in
+                              ("无法确认", "无法判断", "无法判定", "看不清", "不确定",
+                               "无标题", "没有标题", "未标")):
+        match = None
+        note += "（标题读不出，按「保留待复核」处理）"
     entry["axis_check"] = {"want": want, "matches": match, "note": note,
                            "x_title": x.get("title"), "y_title": y0.get("title")}
     verdict = "符合" if match is True else ("不符合" if match is False else "看不清")
@@ -1665,12 +1680,20 @@ def make_verify_image(panel_path, frame, axis, legend_colors, series_files, out_
 
 def _write_template_output(fmt, res, panel, panel_path, csv_dir, outdir, vlm, log):
     """把这一面板的曲线按用户模板再输出一份（模板代码由模型写一次，之后复用）。"""
-    series = []
+    # 同一个系列可能有两个文件（标记点 + 线）：模板里一条曲线只该出现一次，
+    # 取**线**（它包含被遮挡段补出来的点）；只出点的那种取点。
+    picked = {}
     for s in res["series"]:
         xs, ys = vo.read_csv(csv_dir / s["file"])
-        if xs:
-            series.append({"name": str(s.get("series_name") or Path(s["file"]).stem),
-                           "file": s["file"], "x": xs, "y": ys, "params": {}})
+        if not xs:
+            continue
+        name = str(s.get("series_name") or Path(s["file"]).stem)
+        rank = 1 if s.get("kind") == "line" else 0
+        old = picked.get(name)
+        if old is None or rank > old[0] or (rank == old[0] and len(xs) > len(old[1]["x"])):
+            picked[name] = (rank, {"name": name, "file": s["file"], "x": xs, "y": ys,
+                                   "params": {}})
+    series = [v[1] for v in picked.values()]
     if not series:
         return
     context = {"paper": panel_path.parent.parent.name, "panel": panel["id"],

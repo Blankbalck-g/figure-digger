@@ -5,8 +5,9 @@ Key handling - no key is hard-coded; it is read from the first place that has it
   2. <项目根目录>/deepseek_key.txt          (first non-empty line, plain text)
   3. <项目根目录>/secrets.json              ({"deepseek_api_key": "..."})
 
-Every call is cached (sha256 of model+prompt+image) and appended to an audit log, so
-runs are reproducible and reviewable.
+Every call is cached (sha256 of endpoint+model+request+image) and appended to an
+audit log, so runs are reproducible and reviewable without allowing mock/test replies
+to contaminate production results.
 
 CLI:
   python vlm_client.py --check                      # is a key configured / reachable
@@ -167,13 +168,37 @@ class DeepSeekVLM:
             payload["response_format"] = {"type": "json_object"}
         return payload
 
+    def _cache_key(self, image_digest, prompt, system, json_mode, max_tokens, temperature):
+        """Namespace cached replies by the complete response-shaping request.
+
+        In particular, the endpoint must be part of the key: local mock servers and
+        the real API intentionally use the same model name and prompts, but their
+        replies are not interchangeable.
+        """
+        material = {
+            "version": 2,
+            "base_url": self.base_url,
+            "model": self.model,
+            "thinking": self.thinking,
+            "json_mode": bool(json_mode),
+            "max_tokens": int(max_tokens),
+            "temperature": float(temperature),
+            "prompt": prompt,
+            "system": system or "",
+            "image_sha256": image_digest,
+        }
+        return hashlib.sha256(
+            json.dumps(material, ensure_ascii=False, sort_keys=True,
+                       separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+
     def ask(self, image_path, prompt, system=None, json_mode=True, max_tokens=1024,
             retries=1, temperature=0.0):
         # image_path=None -> text-only request (used by the figure selector's
         # shortlist pass); everything else below - cache, log, usage - is shared.
         data_uri, digest = (None, "text-only") if image_path is None else prepare_image(image_path)
-        cache_key = hashlib.sha256(
-            f"{self.model}|{json_mode}|{prompt}|{system or ''}|{digest}".encode()).hexdigest()
+        cache_key = self._cache_key(
+            digest, prompt, system, json_mode, max_tokens, temperature)
         cache_file = CACHE_DIR / f"{cache_key}.json"
         if self.use_cache and cache_file.exists():
             self.usage["cache_hits"] += 1
@@ -388,6 +413,46 @@ def mock_response(prompt):
                 "        out[s['name']+context['ext']]='\\n'.join(lines)+'\\n'\n"
                 "    return out")
         return json.dumps({"ext": ".dat", "params": ["fuel"], "code": code})
+    # 论文级工况知识库：返回原始值/原单位，后续必须由代码换算。
+    if "论文级实验工况知识库" in prompt:
+        keys = []
+        for line in prompt.splitlines():
+            match = re.match(r"-\s*([A-Za-z_][A-Za-z0-9_]*)\s*:", line.strip())
+            if match:
+                keys.append(match.group(1))
+        sample = {
+            "ambient_density": ("0.015", "g/cm3"),
+            "ambient_temperature": ("300", "K"),
+            "fuel_temperature": ("300", "K"),
+            "injection_pressure": ("50", "MPa"),
+            "nozzle_radius": ("0.01", "cm"),
+            "discharge_coefficient": ("0.8", "-"),
+            "fuel_mass": ("0.02", "g"),
+            "ambient_pressure": ("1000000", "dyn/cm2"),
+            "fuel": ("MockFuel", ""),
+            "pressure": ("0.015", ""),
+        }
+        facts = []
+        for index, key in enumerate(dict.fromkeys(keys), start=1):
+            value, unit = sample.get(key, ("0.015", ""))
+            facts.append({"id": f"f{index}", "parameter": key,
+                          "raw_value": value, "raw_unit": unit,
+                          "relation": "direct", "source_parameter": "",
+                          "tags": ["mock-global"],
+                          "evidence": "p1 mock experimental condition", "confidence": 0.99})
+        return json.dumps({"facts": facts, "conditions": [],
+                           "global_fact_ids": [item["id"] for item in facts],
+                           "notes": []})
+    # 图级工况绑定只能选择知识库 ID，不返回任何新数值。
+    if "绑定到论文级工况知识库" in prompt:
+        fact_ids = list(dict.fromkeys(re.findall(r'"id":"(f[0-9A-Za-z_.-]+)"', prompt)))
+        match = re.search(r"系列：(.+?)\n", prompt)
+        names = [x.strip() for x in (match.group(1).split("、") if match else []) if x.strip()]
+        return json.dumps({"status": "bound", "global_condition_ids": [],
+                           "global_fact_ids": fact_ids,
+                           "series": {name: {"condition_ids": [], "fact_ids": []}
+                                      for name in names},
+                           "evidence": "mock binding", "unresolved": []})
     # 曲线的参数（模板要求标注参数时才问）：按提示词里问到的曲线名与参数名原样回一份
     if "params" in p and "曲线有" in p:
         m = re.search(r"曲线有：(.+?)。", prompt)
@@ -410,15 +475,19 @@ def mock_response(prompt):
     # 曲线定位（模型自己找出数据曲线 + 锚点）
     if "anchors" in p:
         return json.dumps({
+            "chart_family": "line", "series_count": 2,
+            "exclude_regions": [{"role": "legend", "box": [0.7, 0.05, 0.95, 0.2]}],
             "series": [
-                {"label": "Heatedtip", "y_axis": "left", "color": "#ed464e",
+                {"label": "Series A", "y_axis": "left", "color": "#ed464e",
                  "dark": False, "linestyle": "dashed", "draw": "line_only",
-                 "closed": False, "overlaps": ["Normaltip"], "occluded": [[0.62, 0.72]],
+                 "closed": False, "overlaps": ["Series B"], "occluded": [[0.62, 0.72]],
+                 "expected_x_extent": [0.08, 0.92], "occluded_ranges": [],
                  "anchors": [[0.08, 0.95], [0.5, 0.55], [0.92, 0.22]],
                  "note": "mock：红色虚线带方块标记"},
-                {"label": "Normaltip", "y_axis": "left", "color": "#1816c0",
+                {"label": "Series B", "y_axis": "left", "color": "#1816c0",
                  "dark": False, "linestyle": "dashed", "draw": "line_only",
-                 "closed": False, "overlaps": ["Heatedtip"], "occluded": [],
+                 "closed": False, "overlaps": ["Series A"], "occluded": [],
+                 "expected_x_extent": [0.08, 0.92], "occluded_ranges": [],
                  "anchors": [[0.08, 0.97], [0.5, 0.52], [0.92, 0.20]],
                  "note": "mock：蓝色虚线带方块标记"}],
             "ignore": [{"what": "蓝色实线，旁边写着 S ∝ t^0.5",

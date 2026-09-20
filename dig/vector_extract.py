@@ -15,10 +15,14 @@ Usage:
 import argparse
 import csv
 import json
+import math
+import re
 import sys
+from collections import defaultdict
 from pathlib import Path
 
 import pdfplumber
+import series_seed as ss
 
 for stream in (sys.stdout, sys.stderr):
     try:
@@ -257,53 +261,200 @@ def calibrate_from_ticks(page, axes, labels, axis="x", min_labels=3, min_r2=0.99
 
 
 def _color_key(c):
-    col = c.get("stroking_color") or c.get("stroke") or c.get("non_stroking_color")
+    stroke_col = c.get("stroking_color")
+    fill_col = c.get("non_stroking_color")
+
+    def chroma(col):
+        return (max(col) - min(col)) if isinstance(col, (list, tuple)) and len(col) == 3 else 0
+
+    # Marker glyphs are often encoded as a coloured fill with either no stroke or a
+    # black outline.  Using the dormant/outline stroking colour turns every red marker
+    # into a fake black series, so choose the visible chromatic fill in that case.
+    if c.get("fill") and isinstance(fill_col, (list, tuple)) and len(fill_col) == 3 \
+            and (not c.get("stroke") or chroma(fill_col) > chroma(stroke_col)):
+        col = fill_col
+    else:
+        col = stroke_col or fill_col
     if isinstance(col, (list, tuple)) and len(col) == 3:
         return tuple(round(float(v), 2) for v in col)
     return None
 
 
-def extract_series(page, axes, xcal, ycal, min_pts=6, min_extent_frac=0.15):
-    """Map every sufficiently long path inside the frame into data coordinates."""
+def _color_hex(color):
+    if not isinstance(color, tuple) or len(color) != 3:
+        return "unknown"
+    vals = (int(round(max(0.0, min(1.0, v)) * 255)) for v in color)
+    return "#{:02x}{:02x}{:02x}".format(*vals)
+
+
+def _hex_key(text):
+    m = re.fullmatch(r"#?([0-9a-fA-F]{6})", str(text or "").strip())
+    if not m:
+        return None
+    s = m.group(1)
+    return tuple(round(int(s[i:i + 2], 16) / 255.0, 2) for i in (0, 2, 4))
+
+
+def _dedupe_points(points, tol=1e-6):
+    out = []
+    for x, y in points:
+        p = (float(x), float(y))
+        if not out or abs(p[0] - out[-1][0]) > tol or abs(p[1] - out[-1][1]) > tol:
+            out.append(p)
+    return out
+
+
+def _vector_candidates(page, axes, min_pts=6, min_extent_frac=0.15):
+    """Return physical vector instances instead of merging everything by colour.
+
+    A single colour may represent several experimental holes/conditions.  Each long
+    PDF path is therefore a separate candidate.  If a series is marker-only, its
+    small circle/square glyphs are reconstructed as a monotone marker track.
+    """
     left, top, right, bottom = axes
-    groups = {}
-    for c in list(page.curves) + list(page.lines):
+    fw, fh = max(1.0, right - left), max(1.0, bottom - top)
+    candidates = []
+    long_colors = set()
+    for object_index, c in enumerate(list(page.curves) + list(page.lines)):
         pts = c.get("pts") or [(c["x0"], c["top"]), (c["x1"], c["bottom"])]
-        inside = [(x, y) for (x, y) in pts if _inside(axes, x, y)]
+        inside = _dedupe_points((x, y) for (x, y) in pts if _inside(axes, x, y))
         if len(inside) < min_pts:
             continue
         xs = [p[0] for p in inside]
         if (max(xs) - min(xs)) < min_extent_frac * (right - left):
             continue
         key = _color_key(c) or ("?",)
-        groups.setdefault(key, []).append(inside)
+        candidates.append({"color_key": key, "points": inside, "source": "path",
+                           "object_index": object_index})
+        long_colors.add(key)
+
+    # Marker-only curves: circles are curves with Bezier commands, squares are PDF
+    # rects.  Do not emit a second marker series when a real polyline of that colour
+    # already exists; the markers are then merely samples drawn on top of the line.
+    marker_groups = defaultdict(list)
+    for c in page.curves:
+        key = _color_key(c) or ("?",)
+        if key in long_colors:
+            continue
+        cx, cy = (c["x0"] + c["x1"]) / 2.0, (c["top"] + c["bottom"]) / 2.0
+        w, h = c["x1"] - c["x0"], c["bottom"] - c["top"]
+        if not _inside(axes, cx, cy) or not (0.3 <= w <= 0.05 * fw and 0.3 <= h <= 0.08 * fh):
+            continue
+        path = c.get("path") or []
+        shape = "circle" if any(cmd and cmd[0] == "c" for cmd in path) else "glyph"
+        marker_groups[(key, shape)].append((cx, cy))
+    for c in page.rects:
+        key = _color_key(c) or ("?",)
+        if key in long_colors:
+            continue
+        cx, cy = (c["x0"] + c["x1"]) / 2.0, (c["top"] + c["bottom"]) / 2.0
+        w, h = c["x1"] - c["x0"], c["bottom"] - c["top"]
+        if not _inside(axes, cx, cy) or not (0.3 <= w <= 0.05 * fw and 0.3 <= h <= 0.08 * fh):
+            continue
+        marker_groups[(key, "rect")].append((cx, cy))
+    shaped_colors = {key for (key, shape), pts in marker_groups.items()
+                     if shape in ("circle", "rect") and len(pts) >= 4}
+    for (key, shape), centres in marker_groups.items():
+        # Generic polygon/dash glyphs commonly duplicate the same sampled series
+        # already represented by circles or squares.  Prefer the explicit marker
+        # geometry; keep generic glyphs only when no such shape exists.
+        if shape == "glyph" and key in shaped_colors:
+            continue
+        track = ss.best_marker_track(centres, axes, min_extent_frac=min_extent_frac)
+        if track:
+            candidates.append({"color_key": key, "points": track,
+                               "source": f"markers:{shape}", "object_index": 0})
+
+    return candidates
+
+
+def _spec_distance(candidate, spec, image_bbox):
+    """Distance from VLM anchors to one exact vector candidate (normalised units)."""
+    anchors = spec.get("anchors") or []
+    if not anchors:
+        return 1.0
+    bx0, by0, bx1, by1 = image_bbox
+    bw, bh = max(1.0, bx1 - bx0), max(1.0, by1 - by0)
+    # Planner anchors use Cartesian plot-normalised coordinates (bottom-left origin),
+    # while PDF/image y coordinates grow downward.
+    pts = [((x - bx0) / bw, (by1 - y) / bh) for x, y in candidate["points"]]
+    ds = []
+    for a in anchors:
+        try:
+            ax, ay = float(a[0]), float(a[1])
+        except (TypeError, ValueError, IndexError):
+            continue
+        ds.append(min(math.hypot(px - ax, py - ay) for px, py in pts))
+    return sum(ds) / len(ds) if ds else 1.0
+
+
+def _assign_specs(candidates, series_spec, image_bbox):
+    """Use the model's semantic inventory to name/count exact vector instances."""
+    unused = set(range(len(candidates)))
+    ordered = []
+    for spec_index, spec in enumerate(series_spec or []):
+        skey = _hex_key(spec.get("color"))
+        ranked = []
+        for i in unused:
+            ckey = candidates[i]["color_key"]
+            color_penalty = 0.0
+            if skey is not None and ckey != skey:
+                color_penalty = 0.35
+            ranked.append((_spec_distance(candidates[i], spec, image_bbox) + color_penalty, i))
+        if not ranked:
+            continue
+        score, best = min(ranked)
+        # A wildly distant anchor is not evidence for this path.  Keep the candidate
+        # generic rather than giving it a confident but wrong legend name.
+        if score > 0.32:
+            continue
+        unused.remove(best)
+        candidates[best]["series_name"] = spec.get("label")
+        candidates[best]["spec_index"] = spec_index
+        candidates[best]["anchor_score"] = round(score, 4)
+        ordered.append(candidates[best])
+    ordered.extend(candidates[i] for i in sorted(unused))
+    return ordered
+
+
+def extract_series(page, axes, xcal, ycal, min_pts=6, min_extent_frac=0.15,
+                   series_spec=None, image_bbox=None):
+    """Map every physical vector path/marker track into data coordinates."""
+    candidates = _vector_candidates(page, axes, min_pts=min_pts,
+                                    min_extent_frac=min_extent_frac)
+    candidates = _assign_specs(candidates, series_spec or [], image_bbox or axes)
 
     out = []
-    for color, chunks in groups.items():
+    for cand in candidates:
+        color = cand["color_key"]
         data = []
-        for chunk in chunks:
-            for x, y in chunk:
-                # calibration was fitted as value = slope * position + intercept
-                xv = xcal["slope"] * x + xcal["intercept"]
-                yv = ycal["slope"] * y + ycal["intercept"]
-                data.append((round(xv, 8), round(yv, 8)))
-        if len(data) < min_pts:
+        for x, y in cand["points"]:
+            # calibration was fitted as value = slope * position + intercept
+            xv = xcal["slope"] * x + xcal["intercept"]
+            yv = ycal["slope"] * y + ycal["intercept"]
+            data.append((round(xv, 8), round(yv, 8)))
+        if len(data) < min(4, min_pts):
             continue
         out.append({
-            "color": "#{:02x}{:02x}{:02x}".format(
-                *(int(round(max(0.0, min(1.0, v)) * 255)) for v in (
-                    color[0], color[1], color[2])) ) if len(color) == 3 else "unknown",
+            "color": _color_hex(color),
             "rgb": list(color) if len(color) == 3 else None,
             "n_points": len(data),
             "x_range": [min(d[0] for d in data), max(d[0] for d in data)],
             "y_range": [min(d[1] for d in data), max(d[1] for d in data)],
+            "series_name": cand.get("series_name"),
+            "source": cand.get("source"),
+            "anchor_score": cand.get("anchor_score"),
             "data": data,
         })
-    out.sort(key=lambda s: -s["n_points"])
     return out
 
 
-def extract_vector_figure(page, bbox, outdir=None, name="vec"):
+def _safe_tag(text, limit=48):
+    s = re.sub(r"[^0-9A-Za-z._ -]+", "_", str(text or "")).strip(" ._")
+    return (s or "series")[:limit]
+
+
+def extract_vector_figure(page, bbox, outdir=None, name="vec", series_spec=None):
     axes = find_axes_box(page, bbox)
     if axes is None:
         return {"error": "no axes frame found", "bbox": bbox}
@@ -318,12 +469,15 @@ def extract_vector_figure(page, bbox, outdir=None, name="vec"):
         "series": [],
     }
     if xcal and ycal:
-        result["series"] = extract_series(page, axes, xcal, ycal)
+        result["series"] = extract_series(page, axes, xcal, ycal,
+                                          series_spec=series_spec, image_bbox=bbox)
         if outdir:
             out = Path(outdir)
             out.mkdir(parents=True, exist_ok=True)
             for i, s in enumerate(result["series"], start=1):
-                p = out / f"{name}_s{i}_{s['color'].lstrip('#')}.csv"
+                label = _safe_tag(s.get("series_name")) if s.get("series_name") else \
+                    f"s{i}_{s['color'].lstrip('#')}"
+                p = out / f"{name}_{label}.csv"
                 with p.open("w", newline="", encoding="utf-8") as fh:
                     wr = csv.writer(fh)
                     wr.writerow(["x", "y"])

@@ -22,6 +22,8 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "dig"))
 
 import series_seed as ss  # noqa: E402
+import batch_extract as be  # noqa: E402
+import run as app  # noqa: E402
 
 for stream in (sys.stdout, sys.stderr):
     try:
@@ -53,6 +55,17 @@ def _marker_line_mask():
         cv2.line(m, (p[0], p[1] - 13), (p[0], p[1] + 13), 255, 2)
         cv2.rectangle(m, (p[0] - 6, p[1] - 6), (p[0] + 6, p[1] + 6), 255, -1)
     return m
+
+
+def _legend_image():
+    img = np.full((480, 640, 3), 255, np.uint8)
+    cv2.rectangle(img, (20, 20), (620, 460), (0, 0, 0), 2)
+    cv2.rectangle(img, (430, 320), (610, 445), (0, 0, 0), 2)
+    for y, color in ((345, (255, 0, 0)), (380, (0, 255, 0)), (415, (0, 0, 255))):
+        cv2.line(img, (445, y), (500, y), color, 3)
+    cv2.putText(img, "Series", (510, 352), cv2.FONT_HERSHEY_SIMPLEX,
+                0.55, (0, 0, 0), 1, cv2.LINE_AA)
+    return img
 
 
 def _fat_blob_mask():
@@ -126,6 +139,10 @@ def main():
     ok = len(ss.collapse_plateaus(line)) == len(line)
     bad += 0 if ok else 1
     print(f"  [{'OK ' if ok else 'FAIL'}] 普通斜线不受影响：{len(line)} 点保持 {len(line)} 点")
+    global_markers = ss.marker_centers(_marker_line_mask())
+    ok = len(global_markers) == 10
+    bad += 0 if ok else 1
+    print(f"  [{'OK ' if ok else 'FAIL'}] 全绘图区 marker：检测到 {len(global_markers)}/10 个")
     # 模型补锚点：缺口在两头（重合处最常见）和中间都要能插进去
     trace = [(float(x), 200.0 - x * 0.1) for x in range(200, 400, 5)]
     head = [(float(x), 215.0 - x * 0.05) for x in (120, 150, 180)]
@@ -138,6 +155,53 @@ def main():
     bad += 0 if ok else 1
     print(f"  [{'OK ' if ok else 'FAIL'}] 模型锚点插缺口：{len(trace)} -> {len(got)} 点，"
           f"x=[{min(xs):.0f},{max(xs):.0f}]（两头+中间都插上了）")
+    # Agent coordinate contract: planner uses plot-normalised coordinates, critic
+    # uses actual data coordinates.  Both must land in the same plotting rectangle,
+    # never in the surrounding tick/label margins.
+    frame = (100, 50, 500, 450)
+    planner_px = ss.anchors_to_pixels([[0.25, 0.25]], frame, (800, 600))
+    critic_px = ss.data_anchors_to_pixels([[2.5, 25]], frame, [0, 10, 0, 100])
+    coord_ok = planner_px == [(200.0, 350.0)] and critic_px == [(200.0, 350.0)]
+    bad += 0 if coord_ok else 1
+    print(f"  [{'OK ' if coord_ok else 'FAIL'}] Agent 坐标协议："
+          f"plot_norm={planner_px} data={critic_px}")
+    # VLM gap/critic anchors are suggestions, so they must stay strictly inside the
+    # plotting rectangle.  A measured line may touch an axis; a model point on that
+    # axis is ambiguous and previously created a false vertical segment at x=0.
+    guarded = app._model_anchors_in_frame(
+        [(98, 200), (100, 200), (101.9, 200), (102, 200),
+         (250, 49), (250, 52), (498, 448), (499, 449)], frame)
+    guard_ok = guarded == [(102.0, 200.0), (250.0, 52.0), (498.0, 448.0)]
+    bad += 0 if guard_ok else 1
+    print(f"  [{'OK ' if guard_ok else 'FAIL'}] Agent 补点坐标框约束：{guarded}")
+    continuous = [(float(x), 200.0) for x in range(100, 201)]
+    gapped = [(float(x), 200.0) for x in list(range(100, 141)) + list(range(170, 201))]
+    no_hole = app._missing_trace_spans(continuous, 100, 200, 6)
+    one_hole = app._missing_trace_spans(gapped, 100, 200, 6)
+    gap_ok = no_hole == [] and one_hole == [(140.0, 170.0)]
+    bad += 0 if gap_ok else 1
+    print(f"  [{'OK ' if gap_ok else 'FAIL'}] Agent 仅补真实缺口："
+          f"连续={no_hole} 断口={one_hole}")
+    # The whole legend is forbidden evidence. Masking only its coloured swatches lets
+    # legend text/markers become fake data or a false continuation of a real curve.
+    legend_img = _legend_image()
+    legend_gray = cv2.cvtColor(legend_img, cv2.COLOR_BGR2GRAY)
+    excluded = be.inner_boxes(legend_gray, (20, 20, 620, 460), img=legend_img)
+    full_boxes = [b for b in excluded if len(b) == 4 and b[2] > 150 and b[3] > 100]
+    legend_ok = len(full_boxes) == 1 and full_boxes[0][0] <= 430 \
+        and full_boxes[0][1] <= 320 and full_boxes[0][0] + full_boxes[0][2] >= 610 \
+        and full_boxes[0][1] + full_boxes[0][3] >= 445
+    bad += 0 if legend_ok else 1
+    print(f"  [{'OK ' if legend_ok else 'FAIL'}] 图例硬禁区：{full_boxes}")
+    semantic = app._planner_exclude_boxes(
+        {"extraction_plan": {"exclude_regions": [
+            {"role": "legend", "box": [0.7, 0.05, 0.95, 0.2]},
+            {"role": "annotation", "box": [0.1, 0.1, 0.2, 0.2]},
+            {"role": "legend", "box": [0.0, 0.0, 1.0, 1.0]},
+        ]}}, (100, 50, 500, 450))
+    semantic_ok = semantic == [(377, 367, 106, 66)]
+    bad += 0 if semantic_ok else 1
+    print(f"  [{'OK ' if semantic_ok else 'FAIL'}] Agent 图例禁区：{semantic}")
     print("通过" if not bad else f"{bad} 项不符合预期")
     return 1 if bad else 0
 

@@ -7,6 +7,7 @@ output/
 out*/
 *_out/
 my_data.dat
+HANDOFF.md
 # 批量输入：论文原文受版权保护，绝不入库
 papers/
 *.pdf

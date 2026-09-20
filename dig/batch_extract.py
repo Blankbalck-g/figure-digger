@@ -246,7 +246,7 @@ def process_panel(image_path, rng, outdir, sat_min, val_min, hue_tol,
 
 
 def legend_boxes(img, frame, max_frac_w=0.60, max_frac_h=0.40):
-    """图例色块的窄条（画在坐标框里面、等宽对齐的那种色块横条）。
+    """Detect legend boxes inside the plot frame using their colour swatches.
 
     `extract_lines.find_boxes` 只认深色边构成的框，而期刊图里的图例框常常是浅灰
     细线——实测 2026-01-0340 的图例一个都没检出，于是图例色块被当成数据线追了出
@@ -254,10 +254,9 @@ def legend_boxes(img, frame, max_frac_w=0.60, max_frac_h=0.40):
     （对 1px 边框更稳）并把"是不是图例"交给色块本身判断：图例色块是一组**很薄、
     等长、x 对齐**的横条，数据曲线几乎不会排成这样。
 
-    返回 (窄带, 图例框) 两份：**窄带**是色块所在的那一条，图例框常常压在数据曲线
-    上（2026-01-0340 图 14 的曲线就从图例框里穿过去），整框抹掉会把真实数据一起
-    抹掉，所以只清窄带。窄带还带着自己的颜色（5 元组），`extract_lines.color_mask`
-    只对**同色**曲线生效——不然一条红线穿过蓝色图例条时会被切断。
+    调用方把**整个图例框**当成硬禁区：框内的线段、marker、文字都只是图例样本，
+    绝不能成为数据证据。真实曲线若从图例下面经过，本来就没有可见像素，应由
+    expected_x_extent / 局部缺口修复处理，而不是把图例样本接进曲线。
     """
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
     left, top, right, bottom = frame
@@ -265,7 +264,7 @@ def legend_boxes(img, frame, max_frac_w=0.60, max_frac_h=0.40):
     cands = []
     for th in (120, 180, 205):
         cands += lc.find_boxes(gray, th)
-    strips, boxes = [], []
+    boxes = []
     for (x, y, w, h) in cands:
         if not (x > left and y > top and x + w < right and y + h < bottom):
             continue
@@ -274,22 +273,16 @@ def legend_boxes(img, frame, max_frac_w=0.60, max_frac_h=0.40):
         sw = [s for s in lc.find_swatches(img, (x, y, w, h), min_run=12)
               if s["thickness_px"] <= 12]
         # 只要求"框里有色块"：图例的排版很自由（三角形标记 + 点划线样本 + 文字），
-        # 硬要求"≥2 条等宽对齐的横条"会漏掉一半图例（实测 2014-01-9079 图 14 的
-        # 图例就只有一条点划线样本，于是它的样本被当成一条平线数据提了出来）。
-        # 这里清的是**色块所在的那条窄带**、而且只对同色曲线生效，风险很小。
+        # 硬要求"≥2 条等宽对齐的横条"会漏掉单条目图例。确认是图例后整框屏蔽。
         if sw:
-            pad = 6
             boxes.append((x, y, w, h))
-            for s in sw:
-                y0 = max(0, int(s["row_y"]) - pad)
-                strips.append((x + 3, y0, max(8, w - 6), 2 * pad, s["hex"]))
     keep = []
     for b in sorted(boxes, key=lambda t: -t[2] * t[3]):
         if any(abs(b[0] - k[0]) < 12 and abs(b[1] - k[1]) < 12
                and abs(b[2] - k[2]) < 12 and abs(b[3] - k[3]) < 12 for k in keep):
             continue
         keep.append(b)
-    return strips, keep
+    return keep
 
 
 def inner_boxes(gray, frame, max_frac=0.92, img=None):
@@ -314,14 +307,14 @@ def inner_boxes(gray, frame, max_frac=0.92, img=None):
                 and w < max_frac * fw and h < max_frac * fh):
             out.append((x, y, w, h))
     keep = []
-    strips, legend = legend_boxes(img, frame) if img is not None else ([], [])
+    legend = legend_boxes(img, frame) if img is not None else []
     def in_legend(b):
         return any(abs(b[0] - k[0]) < 14 and abs(b[1] - k[1]) < 14
                    and abs(b[2] - k[2]) < 14 and abs(b[3] - k[3]) < 14 for k in legend)
 
     for b in out:
         if in_legend(b):
-            # 图例框不整框清：曲线常常从框里穿过去。只清框里的色块窄带（下面加）。
+            # 图例由下面的 `legend` 统一整框加入，避免重复。
             continue
         if b[2] < 0.10 * fw or b[3] < 0.07 * fh:
             continue
@@ -329,7 +322,13 @@ def inner_boxes(gray, frame, max_frac=0.92, img=None):
                and abs(b[2] - k[2]) < 8 and abs(b[3] - k[3]) < 8 for k in keep):
             continue
         keep.append(b)
-    keep.extend(strips)
+    # Legend content is never measured data. Mask the whole box, with a tiny padding
+    # for anti-aliased borders/text. The swatch strips are already inside these boxes.
+    for x, y, w, h in legend:
+        pad = 3
+        x0, y0 = max(left, x - pad), max(top, y - pad)
+        x1, y1 = min(right, x + w + pad), min(bottom, y + h + pad)
+        keep.append((x0, y0, x1 - x0, y1 - y0))
     return keep
 
 

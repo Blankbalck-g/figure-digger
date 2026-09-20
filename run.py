@@ -19,11 +19,17 @@ Outputs under --out:
   verify/      reprojection overlays for visual QA
   paper_config.json   phase-1 result; edit "axis" and set "confirmed": true
   report.md           what was extracted, with the OCR evidence per axis
+
+The CLI is concise by default. Add --verbose for detailed progress and
+--keep-intermediates to persist gap/review/OCR/selection diagnostics.
 """
 
 import argparse
+import io
 import json
+import shutil
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -75,14 +81,57 @@ import template_out as tpl  # noqa: E402
 
 # 并行批处理时子进程不往终端打（会互相穿插），而是各写一份 <out>/<pdf>/run.log。
 _LOG_FILE = None
+_VERBOSE = False
+_KEEP_INTERMEDIATES = False
+_INTERMEDIATE_DIRS = ("gaps", "review", "debug", "select", "objects")
 
 
-def log(msg):
+def log(msg, detail=False):
+    """默认只打印结果和警告；--verbose 或批处理日志保留完整细节。"""
+    if detail and not (_VERBOSE or _LOG_FILE is not None):
+        return
     if _LOG_FILE is not None:
         _LOG_FILE.write(str(msg) + "\n")
         _LOG_FILE.flush()
     else:
         print(msg, flush=True)
+
+
+def detail_log(msg):
+    log(msg, detail=True)
+
+
+def _clean_stale_intermediates(outdir):
+    """Default runs keep only durable outputs, including after an older debug run."""
+    if _KEEP_INTERMEDIATES:
+        return
+    base = Path(outdir)
+    for name in _INTERMEDIATE_DIRS:
+        path = base / name
+        if path.is_dir():
+            shutil.rmtree(path)
+
+
+def _model_anchors_in_frame(anchors, frame, inset=2.0):
+    """模型补点只能落在绘图区内部；实测轨迹仍可合法触碰坐标轴边界。"""
+    left, top, right, bottom = (float(v) for v in frame)
+    return [(float(x), float(y)) for x, y in (anchors or [])
+            if left + inset <= float(x) <= right - inset
+            and top + inset <= float(y) <= bottom - inset]
+
+
+def _missing_trace_spans(trace, x0, x1, min_width):
+    """Return genuinely unmeasured x spans inside a proposed repair window."""
+    xs = sorted({float(x) for x, _y in (trace or []) if x0 <= float(x) <= x1})
+    if not xs:
+        return [(float(x0), float(x1))] if x1 - x0 >= min_width else []
+    spans = []
+    if xs[0] - x0 >= min_width:
+        spans.append((float(x0), xs[0]))
+    spans.extend((a, b) for a, b in zip(xs, xs[1:]) if b - a >= min_width)
+    if x1 - xs[-1] >= min_width:
+        spans.append((xs[-1], float(x1)))
+    return spans
 
 
 def _elapsed(t0):
@@ -100,13 +149,13 @@ def detect_legend_colors(figure_img):
         if sw and (best is None or len(sw) > len(best[1])):
             best = (box, sw)
     if best is None:
-        return [], None
-    box, sw = best
+        return []
+    _box, sw = best
     colors = [s["hex"] for s in sw]
     # A photo has no legend: dozens of "swatches" are just colourful image content.
     if len(colors) > 8:
-        return [], None
-    return colors, box
+        return []
+    return colors
 
 
 def split_figure(figure_path, outdir, margin=None):
@@ -125,7 +174,7 @@ def split_figure(figure_path, outdir, margin=None):
             frame = el.find_frame(gray)
         except Exception:  # noqa: BLE001
             frame = (0, 0, w, h)
-        log(f"      （未检出子图框，按单面板处理 frame={tuple(frame)}）")
+        log(f"      （未检出子图框，按单面板处理 frame={tuple(frame)}）", detail=True)
         return [(Path(figure_path), tuple(frame), (0, 0, w, h))]
 
     if len(boxes) == 1:
@@ -195,19 +244,20 @@ def _overlap_frac(a, b):
     return ox * oy / small if small > 0 else 0.0
 
 
-def _vector_thumb(page, bbox, outdir, name, wanted):
-    """Low-dpi crop of a vector region, only when a selection request needs one.
+def _vector_thumb(page, bbox, outdir, name, needed):
+    """Rendered crop for VLM selection/series understanding of a vector chart.
 
-    The model picks figures from a contact sheet, so every candidate needs *some*
-    picture; for a vector figure that picture has to be rendered first (cheap at 100
-    dpi). Skipped entirely when nobody asked for a specific figure.
+    Vector extraction used to bypass the model entirely.  That made same-colour
+    multi-instance charts impossible to name/count semantically, even though their
+    geometry was exact.  A small crop lets the model provide the inventory and
+    anchors while the PDF paths remain the numerical source of truth.
     """
-    if not wanted:
+    if not needed:
         return None
     path = Path(outdir) / "select" / "thumbs" / f"{name}.png"
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
-        page.crop(tuple(bbox), strict=False).to_image(resolution=100).original.save(path)
+        page.crop(tuple(bbox), strict=False).to_image(resolution=180).original.save(path)
     except Exception:  # noqa: BLE001
         return None
     return path
@@ -258,7 +308,8 @@ def _extract_panel(panel, panel_path, rng, csv_dir, vlm=None):
             if res is not None:
                 return res
         except Exception as exc:  # noqa: BLE001
-            log(f"      （锚点路线失败，回退颜色追踪：{type(exc).__name__}: {exc}）")
+            log(f"      （锚点路线失败，回退颜色追踪：{type(exc).__name__}: {exc}）",
+                detail=True)
     try:
         return be.process_panel(
             panel_path, rng, csv_dir, sat_min=70, val_min=40, hue_tol=16,
@@ -299,7 +350,7 @@ def _gap_crop(img, trace, x0, x1, others, color, out_path):
     return (cx0, cy0, cx1, cy1)
 
 
-def _repair_gaps(vlm, panel, panel_path, picks, names, outdir, log, max_calls=4):
+def _repair_gaps(vlm, panel, panel_path, frame, picks, names, outdir, log, max_calls=3):
     """重合处只显示一种颜色 -> 追断的那几段：让模型给锚点，代码插回去。
 
     只在"这条曲线明显比别人短 / 中间有长断口"时才问，每次只裁那一小块。模型读图、说锚点；
@@ -313,27 +364,93 @@ def _repair_gaps(vlm, panel, panel_path, picks, names, outdir, log, max_calls=4)
     if img is None:
         return 0
     h, w = img.shape[:2]
+    frame_left, frame_top, frame_right, frame_bottom = (float(v) for v in frame)
+    fw = max(1.0, frame_right - frame_left)
     allx = [x for p in usable for x, _y in p["trace"]]
     lo, hi = min(allx), max(allx)
-    if hi - lo < 0.25 * w:
+    if hi - lo < 0.25 * fw:
         return 0
     calls, added = 0, 0
-    shot_dir = Path(outdir) / "gaps"
-    shot_dir.mkdir(parents=True, exist_ok=True)
-    for p in sorted(usable, key=lambda q: -len(q["trace"])):
+    gap_tmp = None
+    if _KEEP_INTERMEDIATES:
+        shot_dir = Path(outdir) / "gaps"
+        shot_dir.mkdir(parents=True, exist_ok=True)
+    else:
+        gap_tmp = tempfile.TemporaryDirectory(prefix="dig_gaps_")
+        shot_dir = Path(gap_tmp.name)
+    # Shorter traces are more likely to be the curve hidden underneath another one;
+    # give the limited repair budget to them first.
+    for p in sorted(usable, key=lambda q: len(q["trace"])):
         if calls >= max_calls:
             break
         xs = [x for x, _y in p["trace"]]
         windows = []
-        if min(xs) - lo > 0.05 * w:
-            windows.append((lo, min(xs)))
-        if hi - max(xs) > 0.05 * w:
-            windows.append((max(xs), hi))
+        expected = p["s"].get("expected_x_extent") or []
+        expected_valid = False
+        try:
+            expected_valid = (len(expected) == 2
+                              and 0.0 <= float(expected[0]) < float(expected[1]) <= 1.0)
+        except (TypeError, ValueError):
+            expected_valid = False
+        # Different physical series often have genuinely different endpoints.  The
+        # union-of-all-traces heuristic is only a fallback when the semantic planner
+        # did not provide an expected extent; otherwise it would extend every shorter
+        # curve to the longest curve in the chart.
+        if not expected_valid:
+            if min(xs) - lo > 0.05 * fw:
+                windows.append((lo, min(xs)))
+            if hi - max(xs) > 0.05 * fw:
+                windows.append((max(xs), hi))
         for gap in ((p["completion"] or {}).get("open_gaps") or []):
-            if gap["cols"] > 0.04 * w:
+            if gap["cols"] > 0.04 * fw:
                 windows.append((gap["x0"], gap["x1"]))
-        for x0, x1 in windows[:2]:
-            if calls >= max_calls or x1 - x0 < 0.04 * w:
+        # The planner sees the whole curve, including the portion whose own colour is
+        # hidden.  Its expected extent/ranges are a much stronger trigger than merely
+        # comparing this trace with the union of whatever the pixel code happened to find.
+        try:
+            if expected_valid:
+                ex0 = frame_left + float(expected[0]) * fw
+                ex1 = frame_left + float(expected[1]) * fw
+                if min(xs) - ex0 > 0.035 * fw:
+                    windows.append((ex0, min(xs)))
+                if ex1 - max(xs) > 0.035 * fw:
+                    windows.append((max(xs), ex1))
+        except (TypeError, ValueError):
+            pass
+        for rg in (p["s"].get("occluded_ranges") or []):
+            try:
+                rx0 = frame_left + float(rg[0]) * fw
+                rx1 = frame_left + float(rg[1]) * fw
+            except (TypeError, ValueError, IndexError):
+                continue
+            if rx1 > rx0:
+                windows.append((rx0, rx1))
+        for a in (p["s"].get("occluded") or []):
+            try:
+                cx = frame_left + float(a[0]) * fw
+            except (TypeError, ValueError, IndexError):
+                continue
+            if not any(abs(x - cx) <= 0.025 * fw for x in xs):
+                windows.append((cx - 0.06 * fw, cx + 0.06 * fw))
+
+        # Merge overlapping planner/geometric windows so one physical gap costs one call.
+        merged_windows = []
+        for a, b in sorted((max(frame_left, min(a, b)), min(frame_right, max(a, b)))
+                           for a, b in windows):
+            if merged_windows and a <= merged_windows[-1][1] + 0.015 * fw:
+                merged_windows[-1] = (merged_windows[-1][0], max(b, merged_windows[-1][1]))
+            else:
+                merged_windows.append((a, b))
+        for x0, x1 in merged_windows[:3]:
+            if calls >= max_calls or x1 - x0 < 0.04 * fw:
+                continue
+            # Planner occlusion is semantic context, not proof that pixels are missing.
+            # Ask the local Agent only where the measured trace has a real long hole or
+            # a genuinely absent endpoint; otherwise a correct continuous start can be
+            # "repaired" into an axis-border spike.
+            missing_spans = _missing_trace_spans(
+                p["trace"], x0, x1, min_width=max(6.0, 0.018 * fw))
+            if not missing_spans:
                 continue
             label = str(p["s"].get("label") or "曲线")
             color = (p["color"] or (0, 0, 0)) if not p["dark"] else (60, 60, 60)
@@ -364,8 +481,38 @@ def _repair_gaps(vlm, panel, panel_path, picks, names, outdir, log, max_calls=4)
                     continue
                 px = cx0 + ax * (cx1 - cx0)
                 py = cy0 + ay * (cy1 - cy0)
-                if x0 - 4 <= px <= x1 + 4:
+                if (x0 - 4 <= px <= x1 + 4
+                        and any(a - 2 <= px <= b + 2 for a, b in missing_spans)):
                     got.append((px, py))
+            got = _model_anchors_in_frame(got, frame, inset=2.0)
+            # Reject gross hallucinations while keeping the gate deliberately broad:
+            # an anchor should agree with endpoint continuation or lie near an actual
+            # occluding trace.  The VLM chooses the shape; this only catches points in
+            # labels/legend/background that cannot connect to either side.
+            known = sorted((float(x), float(y)) for x, y in p["trace"])
+            other_dense = [ss.dense_trace(t) for _n, t in others]
+            plausible = []
+            for px, py in sorted(got):
+                prev_pt = next((q for q in reversed(known) if q[0] <= px), None)
+                next_pt = next((q for q in known if q[0] >= px), None)
+                ok = False
+                if prev_pt and next_pt and next_pt[0] > prev_pt[0]:
+                    pred = (prev_pt[1] + (next_pt[1] - prev_pt[1])
+                            * (px - prev_pt[0]) / (next_pt[0] - prev_pt[0]))
+                    ok = abs(py - pred) <= max(18.0, 0.18 * h)
+                if not ok:
+                    near = []
+                    for d in other_dense:
+                        cy = d.get(int(round(px)))
+                        if cy is not None:
+                            near.append(abs(cy - py))
+                    ok = bool(near) and min(near) <= max(14.0, 0.08 * h)
+                if not ok and (prev_pt or next_pt):
+                    endpoint = prev_pt or next_pt
+                    ok = abs(py - endpoint[1]) <= max(24.0, 0.16 * (frame_bottom - frame_top))
+                if ok:
+                    plausible.append((px, py))
+            got = plausible
             if not got:
                 continue
             merged = ss.bridge_through_anchors(p["trace"], got)
@@ -374,11 +521,16 @@ def _repair_gaps(vlm, panel, panel_path, picks, names, outdir, log, max_calls=4)
                 added += n_add
                 p["completion"] = dict(p["completion"] or {})
                 p["completion"]["model_anchors"] = {
-                    "cols": n_add,
+                    "cols": n_add, "x0": int(x0), "x1": int(x1),
                     "by": f"模型读图补的锚点（{len(got)} 个，x={int(x0)}~{int(x1)}）"}
+                p["completion"].setdefault("spans", []).append(
+                    {"x0": int(x0), "x1": int(x1), "cols": n_add,
+                     "by": "模型读图补缺口"})
                 p["trace"] = merged
                 log(f"      模型补缺口：{label} x={int(x0)}~{int(x1)}，"
-                    f"插了 {len(got)} 个锚点（+{n_add} 列）")
+                    f"插了 {len(got)} 个锚点（+{n_add} 列）", detail=True)
+    if gap_tmp is not None:
+        gap_tmp.cleanup()
     return added
 
 
@@ -396,7 +548,7 @@ def _spec_dark(s, color):
         return True
     # 模型给的颜色本身是黑/深灰（黑白论文图整本都这样）。注意 resolve_color 会拒绝
     # 灰白色，所以这里必须看**模型给的原始十六进制**，不能只看解析结果。
-    for candidate in (color, s.get("color")):
+    for candidate in (color, s.get("line_color"), s.get("color")):
         if candidate is None:
             continue
         try:
@@ -450,6 +602,76 @@ def _markers_cover_curve(markers, trace, min_n=5, cover=0.6):
     return span_t > 0 and span_m >= cover * span_t
 
 
+_NON_DATA_ROLES = {"control", "reference", "annotation", "legend", "inset", "other"}
+
+
+def _planner_series(found):
+    """Normalise the VLM's semantic plan into extraction-ready series specs.
+
+    The planner may describe a black connector with coloured identity markers.  Code
+    traces ``line_color`` while retaining ``marker_color`` for identity/visualisation.
+    Non-data roles stay auditable in ``ignore`` but never reach the pixel extractor.
+    """
+    series, ignored = [], []
+    for raw in found.get("series") or []:
+        if not isinstance(raw, dict):
+            continue
+        s = dict(raw)
+        role = str(s.get("role") or "data").strip().lower()
+        if role in _NON_DATA_ROLES:
+            ignored.append({"what": s.get("label") or role,
+                            "why": f"planner role={role}，不是数值数据系列"})
+            continue
+        draw = str(s.get("draw") or "").strip().lower()
+        line_color = s.get("line_color")
+        marker_color = s.get("marker_color")
+        trace_color = line_color or (marker_color if draw == "markers_only" else None) \
+            or s.get("color")
+        s["role"] = role
+        s["line_color"] = line_color
+        s["marker_color"] = marker_color
+        s["display_color"] = marker_color or trace_color
+        s["color"] = trace_color
+        series.append(s)
+    ignored.extend(x for x in (found.get("ignore") or []) if isinstance(x, dict))
+    return series, ignored
+
+
+def _planner_exclude_boxes(panel, frame):
+    """Validated VLM-declared legend/inset boxes -> pixel exclusion rectangles.
+
+    This is a coarse semantic hint, not pixel measurement. It complements local
+    rectangle detection when a legend has no visible border. Validation keeps a bad
+    model box from erasing most of the plotting area.
+    """
+    left, top, right, bottom = (float(v) for v in frame)
+    fw, fh = max(1.0, right - left), max(1.0, bottom - top)
+    out = []
+    regions = ((panel.get("extraction_plan") or {}).get("exclude_regions") or [])
+    for item in regions:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("role") or "").strip().lower() not in ("legend", "inset"):
+            continue
+        box = item.get("box") or []
+        try:
+            x0, y0, x1, y1 = (float(v) for v in box)
+        except (TypeError, ValueError):
+            continue
+        if not (0 <= x0 < x1 <= 1 and 0 <= y0 < y1 <= 1):
+            continue
+        if (x1 - x0) * (y1 - y0) > 0.35:
+            continue
+        px0, px1 = left + x0 * fw, left + x1 * fw
+        py0, py1 = bottom - y1 * fh, bottom - y0 * fh
+        pad = 3.0
+        xx0, yy0 = max(left, px0 - pad), max(top, py0 - pad)
+        xx1, yy1 = min(right, px1 + pad), min(bottom, py1 + pad)
+        if xx1 - xx0 >= 12 and yy1 - yy0 >= 12:
+            out.append((int(xx0), int(yy0), int(xx1 - xx0), int(yy1 - yy0)))
+    return out
+
+
 REVIEW_COLORS = [(0, 0, 255), (0, 170, 0), (255, 0, 0), (0, 150, 255),
                  (255, 0, 190), (110, 60, 0), (0, 90, 255), (170, 0, 170)]
 
@@ -499,13 +721,22 @@ def revise_panel(vlm, panel_path, panel, spec, entries, failed, aliases, csv_dir
         cv2.drawMarker(img, (ax, ay), (0, 0, 255), cv2.MARKER_TILTED_CROSS, 22, 3)
         cv2.putText(img, f"✗{str(f.get('label'))[:12]}", (ax + 10, ay + 6),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2, cv2.LINE_AA)
-    spec_text = "；".join(
-        f"{s.get('label')}(draw={s.get('draw') or s.get('output')}"
-        f"{', 黑线' if s.get('dark') else ''}{', 闭合' if s.get('closed') else ''})"
-        for s in spec) or "（无）"
+    spec_rows = []
+    for s in spec:
+        extent = s.get("expected_x_extent")
+        spec_rows.append(
+            f"{s.get('label')}(draw={s.get('draw') or s.get('output')}"
+            f"{', 黑线' if s.get('dark') else ''}{', 闭合' if s.get('closed') else ''}"
+            f"{', 期望x范围=' + str(extent) if extent else ''})")
+    spec_text = f"期望物理曲线总数={len(spec)}；" + ("；".join(spec_rows) or "（无）")
     base = Path(csv_dir).parent if csv_dir else panel_path.parent.parent
-    outdir = base / "review"
-    outdir.mkdir(parents=True, exist_ok=True)
+    review_tmp = None
+    if _KEEP_INTERMEDIATES:
+        outdir = base / "review"
+        outdir.mkdir(parents=True, exist_ok=True)
+    else:
+        review_tmp = tempfile.TemporaryDirectory(prefix="dig_review_")
+        outdir = Path(review_tmp.name)
     png = outdir / f"{panel['id']}_review.png"
     iio.imwrite(png, img)
     ax = panel.get("axis") or {}
@@ -516,14 +747,20 @@ def revise_panel(vlm, panel_path, panel, spec, entries, failed, aliases, csv_dir
     try:
         data = vt.revise_traces(vlm, png, spec_text, "\n".join(rows), axis_text=axis_text)
     except Exception as exc:  # noqa: BLE001
+        if review_tmp is not None:
+            review_tmp.cleanup()
         log(f"      （复盘调用失败，按原样输出：{type(exc).__name__}: {exc}）")
         return None
-    (outdir / f"{panel['id']}_review.json").write_text(
-        json.dumps({"spec": spec_text, "found": rows, "answer": data},
-                   ensure_ascii=False, indent=2), encoding="utf-8")
+    if _KEEP_INTERMEDIATES:
+        (outdir / f"{panel['id']}_review.json").write_text(
+            json.dumps({"spec": spec_text, "found": rows, "answer": data},
+                       ensure_ascii=False, indent=2), encoding="utf-8")
     log(f"      复盘：merge={data.get('merge') or []} drop={data.get('drop') or []} "
-        f"add={len(data.get('add') or [])} axis_fix={'有' if data.get('axis_fix') else '无'}"
-        f" —— {str(data.get('note'))[:60]}")
+        f"add={len(data.get('add') or [])} extend={len(data.get('extend') or [])} "
+        f"axis_fix={'有' if data.get('axis_fix') else '无'}"
+        f" —— {str(data.get('note'))[:60]}", detail=True)
+    if review_tmp is not None:
+        review_tmp.cleanup()
     return data
 
 
@@ -573,6 +810,7 @@ def _extract_seeded(panel, panel_path, rng, csv_dir, spec, vlm=None):
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     frame = be._frame_of(gray, panel.get("frame"))
     exclude = be.inner_boxes(gray, frame, img=img)
+    exclude.extend(_planner_exclude_boxes(panel, frame))
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
     xmin, xmax, ymin, ymax = rng
     palette = list(panel.get("legend_colors") or []) + \
@@ -580,6 +818,17 @@ def _extract_seeded(panel, panel_path, rng, csv_dir, spec, vlm=None):
     series, failed = [], []
     used_keys, accepted = set(), []
     width, height = img.shape[1], img.shape[0]
+
+    def data_range_for(s):
+        """Axis range for one semantic series, including dual-Y multipliers."""
+        symin, symax = ymin, ymax
+        side = str(s.get("y_axis") or "left").lower()
+        detail = (panel.get("y_axes") or {}).get(side) or {}
+        yr = detail.get("range")
+        if isinstance(yr, (list, tuple)) and len(yr) == 2:
+            mult = _as_float(detail.get("multiplier"), 1.0)
+            symin, symax = float(yr[0]) * mult, float(yr[1]) * mult
+        return [xmin, xmax, symin, symax]
 
     def trace_one(s, hue_tol):
         """一条 spec -> (pick, 失败说明)。颜色/黑线两条路线在这里合流。"""
@@ -663,9 +912,43 @@ def _extract_seeded(panel, panel_path, rng, csv_dir, spec, vlm=None):
         elif cinfo:
             p["completion"] = cinfo
 
+    # Marker centres are stronger evidence than an inferred hidden curve.  When a
+    # colour belongs to exactly one semantic series, detect its glyphs across the
+    # whole plotting frame (legend boxes already excluded) instead of restricting
+    # detection to the possibly truncated trace corridor.  Same-colour multi-series
+    # charts stay on the corridor/anchor path to preserve instance identity.
+    color_counts = {}
+    for s in spec:
+        key = str(s.get("color") or "").strip().lower()
+        if key:
+            color_counts[key] = color_counts.get(key, 0) + 1
+    for p in picks:
+        skey = str(p["s"].get("color") or "").strip().lower()
+        if p["dark"] or not _spec_has_markers(p["s"]) or color_counts.get(skey) != 1:
+            continue
+        mmask = el.color_mask(hsv, frame, p["color"], 12, exclude_boxes=exclude)
+        centres = ss.best_marker_track(
+            ss.marker_centers(mmask), frame, min_points=3, min_extent_frac=0.12)
+        marker_trace = ss.line_through_markers(centres)
+        if len(marker_trace) < 3:
+            continue
+        mspan = (marker_trace[-1][0] - marker_trace[0][0]) / max(1.0, frame[2] - frame[0])
+        if mspan < 0.12:
+            continue
+        p["pre_markers"] = centres
+        # Keep exact line pixels outside the first/last fully visible marker.  Endpoint
+        # glyphs are often clipped by the axes border and disappear during erosion
+        # (e.g. a data point exactly at the origin); the connected line still reaches
+        # that boundary and is valid measured evidence.
+        combined = {int(round(x)): (float(x), float(y)) for x, y in p["trace"]}
+        combined.update({int(round(x)): (float(x), float(y)) for x, y in marker_trace})
+        p["trace"] = [combined[x] for x in sorted(combined)]
+        p["span"] = max(p.get("span") or 0.0, mspan)
+
     # 还有没补上的缺口（重合处只显示一种颜色、压在下面的追断了）-> 让模型读图给锚点
     if vlm is not None:
-        _repair_gaps(vlm, panel, panel_path, picks, names, Path(csv_dir).parent, log)
+        _repair_gaps(vlm, panel, panel_path, frame, picks, names,
+                     Path(csv_dir).parent, log)
 
     def build_entry(p):
         """一条 pick -> 待落盘的 entry（数据先在内存里，复盘后统一写文件）。"""
@@ -680,11 +963,15 @@ def _extract_seeded(panel, panel_path, rng, csv_dir, spec, vlm=None):
         want = _spec_want(s)
         markers = []
         if _spec_has_markers(s):
-            mmask = (el.dark_mask(gray, frame, exclude_boxes=exclude) if p["dark"]
-                     else el.color_mask(hsv, (0, 0, width - 1, height - 1), p["color"], 12))
-            markers = ss.markers_in_mask(mmask, trace)
+            markers = list(p.get("pre_markers") or [])
+            if not markers:
+                mmask = (el.dark_mask(gray, frame, exclude_boxes=exclude) if p["dark"]
+                         else el.color_mask(hsv, frame, p["color"], 12,
+                                            exclude_boxes=exclude))
+                markers = ss.markers_in_mask(mmask, trace)
         note_draw = None
         marker_line = False
+        point_trace = list(markers)
         if markers:
             trace = ss.snap_line_to_markers(trace, markers)      # 标记处别走平台
         if _markers_cover_curve(markers, trace):
@@ -692,13 +979,17 @@ def _extract_seeded(panel, panel_path, rng, csv_dir, spec, vlm=None):
             # 阶梯消失，每个点对应一个值（线是点连出来的，不额外损失信息）
             centers = ss.line_through_markers(markers)
             if len(centers) >= 3:
-                # 标记范围**之外**的点要留着——那正是模型读图补的锚点（被压住的那一段
-                # 没有标记）。上一版直接用 centers 覆盖，把刚补好的缺口又抹掉了
-                # （实测 2024-01-3408 Diesel：补了锚点，CSV 的 x 范围却没变）。
+                # 模型/遮挡补全产生的点必须保留。除了标记范围两端，还要保留补全信息
+                # 明确指出的中间区间；否则 markers_connected 分支会再次把修好的缺口抹掉。
                 mx0 = min(c[0] for c in centers)
                 mx1 = max(c[0] for c in centers)
-                kept = [(x, y) for x, y in trace if x < mx0 - 1.0 or x > mx1 + 1.0]
+                spans = list((p.get("completion") or {}).get("spans") or [])
+                kept = [(x, y) for x, y in trace
+                        if x < mx0 - 1.0 or x > mx1 + 1.0
+                        or any(float(sp.get("x0", x + 1)) - 1 <= x <=
+                               float(sp.get("x1", x - 1)) + 1 for sp in spans)]
                 trace = sorted(kept + centers)
+                point_trace = trace
                 # 一个标记一个点：散点图上十几个点就是完整数据，不能再按"线要 20 点"砍
                 marker_line = True
                 note_draw = f"按标记中心出数据（{len(centers)} 个点），消除标记造成的阶梯"
@@ -710,14 +1001,18 @@ def _extract_seeded(panel, panel_path, rng, csv_dir, spec, vlm=None):
                 note_draw = f"标记处的平台已压缩（{len(trace)} -> {len(flat)} 点），消除阶梯"
                 trace = flat
         if str(s.get("draw") or "").lower() == "markers_connected" and len(markers) >= 3:
-            trace = ss.line_through_markers(markers)             # 点即曲线
             want = "points"
+            if not marker_line:
+                trace = ss.line_through_markers(markers)         # 没有补全时：点即曲线
+                point_trace = trace
             note_draw = note_draw or "散点用折线连起来：点即曲线（不再另出线文件）"
         elif want == "points" and len(markers) < 3:
             want = "line"
             note_draw = "模型说这条带标记，但没检出标记符号，改出线轨迹"
-        line_data = el.to_data(trace, frame, xmin, xmax, ymin, ymax)
-        point_data = el.to_data(markers, frame, xmin, xmax, ymin, ymax)
+        p["trace"] = trace
+        _sx0, _sx1, symin, symax = data_range_for(s)
+        line_data = el.to_data(trace, frame, xmin, xmax, symin, symax)
+        point_data = el.to_data(point_trace, frame, xmin, xmax, symin, symax)
         return {"p": p, "want": want, "markers": markers, "line_data": line_data,
                 "point_data": point_data, "note_dup": None, "note_draw": note_draw,
                 "marker_line": marker_line, "span": span}, None
@@ -759,12 +1054,68 @@ def _extract_seeded(panel, panel_path, rng, csv_dir, spec, vlm=None):
 
     # ---- 第四遍：模型复盘（把追出来的轨迹编号画回原图，让模型核对）----
     review = None
-    if vlm is not None and (failed or aliases
-                            or any(e.get("note_dup") for e in entries)
-                            or len(entries) != len([s for s in spec])):
+    # Critic is a mandatory agent stage when VLM is enabled.  Conditional review
+    # missed the most dangerous case: a plausible-looking but truncated curve with
+    # the correct count.  One full-panel call is cheap and can request only targeted
+    # extend/add/drop actions; local repair calls happen solely when it finds a defect.
+    if vlm is not None and (entries or failed or spec):
         review = revise_panel(vlm, panel_path, panel, spec, entries, failed, aliases,
                               csv_dir=csv_dir)
         if review:
+            for ext in (review.get("extend") or []):
+                try:
+                    idx = int(ext.get("id")) - 1
+                except (TypeError, ValueError, AttributeError):
+                    continue
+                if not (0 <= idx < len(entries)):
+                    continue
+                entry0 = entries[idx]
+                p0 = entry0["p"]
+                coord_space = str(ext.get("coord_space") or "data").lower()
+                if coord_space in ("plot_norm", "normalized", "norm"):
+                    anchors_px = ss.anchors_to_pixels(
+                        ext.get("anchors"), frame, (width, height))
+                else:
+                    anchors_px = ss.data_anchors_to_pixels(
+                        ext.get("anchors"), frame, data_range_for(p0["s"]))
+                anchors_px = _model_anchors_in_frame(anchors_px, frame, inset=2.0)
+                if not anchors_px:
+                    continue
+                measured = sorted((float(x), float(y)) for x, y in p0["trace"])
+                gap_min = 0.05 * max(1.0, frame[2] - frame[0])
+                long_gaps = [(a[0], b[0]) for a, b in zip(measured, measured[1:])
+                             if b[0] - a[0] >= gap_min]
+                # `extend` may add missing evidence, never rewrite an already observed
+                # span.  This protects exact marker/path measurements from a critic
+                # hallucinating a visual defect in the review rendering.
+                anchors_px = [(x, y) for x, y in anchors_px
+                              if x < measured[0][0] - 1.0 or x > measured[-1][0] + 1.0
+                              or any(a < x < b for a, b in long_gaps)]
+                if not anchors_px:
+                    log(f"      复盘补范围已忽略：#{idx + 1} 的锚点均落在已有观测区间")
+                    continue
+                merged = ss.bridge_through_anchors(p0["trace"], anchors_px)
+                if len(merged) <= len(p0["trace"]):
+                    continue
+                old_n = len(p0["trace"])
+                p0["raw_trace"] = p0.get("raw_trace") or list(p0["trace"])
+                p0["trace"] = merged
+                p0["completion"] = dict(p0.get("completion") or {})
+                p0["completion"]["model_anchors"] = {
+                    "cols": len(merged) - old_n,
+                    "by": f"模型复盘补范围（{len(anchors_px)} 个锚点）"}
+                p0["completion"].setdefault("spans", []).append({
+                    "x0": int(min(x for x, _y in anchors_px)),
+                    "x1": int(max(x for x, _y in anchors_px)),
+                    "cols": len(merged) - old_n,
+                    "by": "模型复盘补范围"})
+                rebuilt, why_ext = build_entry(p0)
+                if rebuilt is not None:
+                    entries[idx] = rebuilt
+                    log(f"      复盘补范围：#{idx + 1} {p0['s'].get('label')} "
+                        f"+{len(merged) - old_n} 列（{str(ext.get('why') or '')[:42]}）")
+                elif why_ext:
+                    failed.append(why_ext)
             entries, failed, aliases = _apply_review(review, entries, failed, aliases)
             for s in (review.get("add") or []):
                 pick, why = trace_one(s, 8)
@@ -814,6 +1165,9 @@ def _extract_seeded(panel, panel_path, rng, csv_dir, spec, vlm=None):
         color = p["color"]
         color_hex = ("#{:02x}{:02x}{:02x}".format(int(color[2]), int(color[1]), int(color[0]))
                      if color is not None else str(s.get("color") or "#000000"))
+        display_hex = str(s.get("display_color") or color_hex)
+        if not display_hex.startswith("#"):
+            display_hex = "#" + display_hex
         cinfo = p["completion"] or {}
         raw = p.get("raw_trace")
         if raw and cinfo:
@@ -826,7 +1180,9 @@ def _extract_seeded(panel, panel_path, rng, csv_dir, spec, vlm=None):
                 "file": name.name, "source": "seeded", "kind": kind_out,
                 "geometry": p["kind"], "series_name": s.get("label"), "output": want,
                 "draw": s.get("draw"), "dark": bool(p["dark"]),
-                "color_hex": color_hex, "color_src": p["how"], "y_axis": s.get("y_axis"),
+                "color_hex": display_hex, "trace_color_hex": color_hex,
+                "color_src": p["how"], "y_axis": s.get("y_axis"),
+                "y_axis_range": data_range_for(s)[2:],
                 "anchors": s.get("anchors"), "note": s.get("note"),
                 "anchors_hit": p["info"].get("hits"),
                 "anchor_med_dist": (round(p["info"]["med_dist"], 1)
@@ -1060,15 +1416,25 @@ def merge_axis(vlm_axis, ocr_axis, tol_frac=0.02):
 
 
 def print_vlm_usage(client, phase, before=None):
-    """Print the VLM spend for a phase, taken from the API's own usage counters.
-
-    Goes through log() so a parallel worker writes it into that paper's run.log
-    instead of interleaving it into the shared terminal.
-    """
+    """默认一行汇总；--verbose/并行日志里保留逐项明细。"""
     if client is None:
         return
     u = client.usage
     d = {k: u.get(k, 0) - (before or {}).get(k, 0) for k in u}
+    p = vlmc.PRICES.get(client.model)
+    cost = ""
+    if p:
+        hit = d["cache_hit_tokens"]
+        miss = d["cache_miss_tokens"] or max(0, d["prompt_tokens"] - hit)
+        lo = (hit / 1e6 * p["in_hit"][0] + miss / 1e6 * p["in_miss"][0]
+              + d["completion_tokens"] / 1e6 * p["out"][0])
+        hi = (hit / 1e6 * p["in_hit"][1] + miss / 1e6 * p["in_miss"][1]
+              + d["completion_tokens"] / 1e6 * p["out"][1])
+        cost = f", 约 ${lo:.4f}–${hi:.4f}"
+    if not (_VERBOSE or _LOG_FILE is not None):
+        log(f"VLM {phase}: {d['calls']} 次调用, {d['cache_hits']} 次本地缓存, "
+            f"{d['prompt_tokens']:,} in / {d['completion_tokens']:,} out{cost}")
+        return
     bar = "─" * 66
     title = (f"VLM 用量（{phase}）" if phase.endswith(("合计", "总计"))
              else f"VLM 用量（{phase} 阶段）")
@@ -1084,21 +1450,14 @@ def print_vlm_usage(client, phase, before=None):
     if d["calls"]:
         log(f"  每次平均     : 输入 {d['prompt_tokens'] / d['calls']:,.0f} / "
             f"输出 {d['completion_tokens'] / d['calls']:,.0f} tokens")
-    p = vlmc.PRICES.get(client.model)
     if p:
-        hit = d["cache_hit_tokens"]
-        miss = d["cache_miss_tokens"] or max(0, d["prompt_tokens"] - hit)
-        lo = (hit / 1e6 * p["in_hit"][0] + miss / 1e6 * p["in_miss"][0]
-              + d["completion_tokens"] / 1e6 * p["out"][0])
-        hi = (hit / 1e6 * p["in_hit"][1] + miss / 1e6 * p["in_miss"][1]
-              + d["completion_tokens"] / 1e6 * p["out"][1])
         log(f"  预估费用     : ${lo:.4f} ~ ${hi:.4f}   （{client.model}，闲时~高峰，官方价）")
     log(f"  逐次明细     : {vlmc.LOG_PATH}")
     log(bar)
 
 
 def analyze(pdf_path, outdir, dpi=300, vlm=None, pages=None, use_ocr=None, want=None,
-            want_deep=False, find_series=True):
+            want_deep=False, find_series=True, report_usage=True):
     """use_ocr=None means "auto": with a VLM the model is the primary axis reader and
     OCR (5-10x slower, same job) stays off; without one OCR is the only reader left."""
     if use_ocr is None:
@@ -1106,14 +1465,15 @@ def analyze(pdf_path, outdir, dpi=300, vlm=None, pages=None, use_ocr=None, want=
     t0 = time.time()
     pdf_path = Path(pdf_path).resolve()
     outdir = Path(outdir).resolve()
+    _clean_stale_intermediates(outdir)
     (outdir / "figures").mkdir(parents=True, exist_ok=True)
     (outdir / "panels").mkdir(parents=True, exist_ok=True)
-    if find_series and vlm is not None:
-        (outdir / "objects").mkdir(parents=True, exist_ok=True)
     if use_ocr:
-        (outdir / "debug").mkdir(parents=True, exist_ok=True)
+        if _KEEP_INTERMEDIATES:
+            (outdir / "debug").mkdir(parents=True, exist_ok=True)
     elif vlm is not None:
-        log("OCR 交叉核对已关闭（VLM 模式下默认关闭；要两路对照请加 --ocr）")
+        log("OCR 交叉核对已关闭（VLM 模式下默认关闭；要两路对照请加 --ocr）",
+            detail=True)
 
     with tp.pdfplumber.open(pdf_path) as pdf:
         want_pages = None
@@ -1143,19 +1503,21 @@ def analyze(pdf_path, outdir, dpi=300, vlm=None, pages=None, use_ocr=None, want=
                 if res.get("x_calibration") and res.get("y_calibration"):
                     vector_found.append({"page": pno, "reg": reg, "res": res, "id": vid,
                                          "inner": _vector_inner_text(page, res.get("axes")),
-                                         "thumb": _vector_thumb(page, reg["bbox"], outdir, vid, want)})
+                                         "thumb": _vector_thumb(
+                                             page, reg["bbox"], outdir, vid,
+                                             bool(want or (vlm is not None and find_series)))})
                     continue
                 # 区域里没有 PDF 自带的可读刻度文字。两种常见原因：刻度是路径而非文字；
                 # 或者页面边框/分栏线与图并成了一个区域。前者渲染成位图还能救回来，后者不是图。
                 bx0, by0, bx1, by1 = reg["bbox"]
                 if (bx1 - bx0) > 0.9 * page.width and (by1 - by0) > 0.9 * page.height:
                     log(f"[矢量] p{pno} bbox={reg['bbox']} 跳过：区域覆盖整页"
-                        "（页面边框/分栏线被并了进来，不是数据图）")
+                        "（页面边框/分栏线被并了进来，不是数据图）", detail=True)
                     continue
                 if not res.get("axes"):
                     # 连坐标框都没有，只是一堆页面线条/表格线：回退成位图也读不出坐标轴
                     log(f"[矢量] p{pno} bbox={reg['bbox']} 跳过：无坐标框"
-                        "（页面线条/表格，非数据图）")
+                        "（页面线条/表格，非数据图）", detail=True)
                     continue
                 # 留出边距：区域边界常常正好压在坐标框上，紧贴裁剪会让后面的找框
                 # 逻辑把框线当成图片边界而丢弃；另外刻度标签也需要这点空间。
@@ -1165,7 +1527,7 @@ def analyze(pdf_path, outdir, dpi=300, vlm=None, pages=None, use_ocr=None, want=
                 if any(_overlap_frac(crop_box, eb) > 0.5
                        for eb in exported_by_page.get(pno, [])):
                     log(f"[矢量] p{pno} bbox={reg['bbox']} 跳过：与已导出的位图图重叠，"
-                        "同一张图不重复提取")
+                        "同一张图不重复提取", detail=True)
                     continue
                 fb_path = outdir / "figures" / f"{vid}.png"
                 try:
@@ -1173,7 +1535,7 @@ def analyze(pdf_path, outdir, dpi=300, vlm=None, pages=None, use_ocr=None, want=
                         resolution=dpi).original.save(fb_path)
                 except Exception as exc:  # noqa: BLE001
                     log(f"[矢量] p{pno} bbox={reg['bbox']} 跳过：无刻度文字且渲染失败"
-                        f"（{type(exc).__name__}: {exc}）")
+                        f"（{type(exc).__name__}: {exc}）", detail=True)
                     continue
                 # 坐标框在 PDF 里已经找到了，直接换算成像素给位图路线用：
                 # 比自己再去图里猜一次框更可靠（刻度线贴边时猜框会失手）。
@@ -1189,7 +1551,7 @@ def analyze(pdf_path, outdir, dpi=300, vlm=None, pages=None, use_ocr=None, want=
                     "id": vid, "bbox": reg["bbox"], "thumb": fb_path,
                 })
                 log(f"[矢量] p{pno} bbox={reg['bbox']} 无刻度文字 → "
-                    f"渲染为位图改走图像路线：{fb_path.name}")
+                    f"渲染为位图改走图像路线：{fb_path.name}", detail=True)
 
     captions_by_page = {}
     for p in report["pages"]:
@@ -1226,14 +1588,25 @@ def analyze(pdf_path, outdir, dpi=300, vlm=None, pages=None, use_ocr=None, want=
         exported.insert(0, {"path": it["path"], "page": it["page"], "frame": it["frame"],
                             "note": it["note"]})
     cards.sort(key=lambda c: (c["page"], round(c["bbox"][1]), round(c["bbox"][0])))
-    fi.attach_captions(cards, captions_by_page, log=log)
+    fi.attach_captions(cards, captions_by_page, log=detail_log)
     caption_of = {c["id"]: c["caption"] for c in cards}
 
     keep = None
     if want:
-        decision = fi.select(want, cards, vlm=vlm, out_dir=outdir / "select", log=log,
-                             body_text=lambda: _body_digest(pdf_path, want_pages),
-                             deep=want_deep)
+        select_tmp = None
+        if _KEEP_INTERMEDIATES:
+            select_dir = outdir / "select"
+        else:
+            select_tmp = tempfile.TemporaryDirectory(prefix="dig_select_")
+            select_dir = Path(select_tmp.name)
+        try:
+            decision = fi.select(want, cards, vlm=vlm, out_dir=select_dir,
+                                 log=detail_log,
+                                 body_text=lambda: _body_digest(pdf_path, want_pages),
+                                 deep=want_deep)
+        finally:
+            if select_tmp is not None:
+                select_tmp.cleanup()
         keep = set(decision["ids"])
         config["selection"] = decision
         if not keep:
@@ -1279,9 +1652,34 @@ def analyze(pdf_path, outdir, dpi=300, vlm=None, pages=None, use_ocr=None, want=
                 "series_count": len(res.get("series", [])),
             },
         }
+        if vlm is not None and find_series and it.get("thumb"):
+            try:
+                found = vt.find_series(vlm, it["thumb"], it.get("inner") or "（未读到图例文字）")
+                spec, ignored = _planner_series(found)
+                if spec:
+                    entry["series_spec"] = spec
+                    entry["extraction_plan"] = {
+                        "chart_family": found.get("chart_family"),
+                        "series_count": len(spec),
+                        "reported_series_count": found.get("series_count"),
+                        "exclude_regions": found.get("exclude_regions") or [],
+                    }
+                    entry["ignore"] = ignored
+                    entry["legend_colors"] = list(dict.fromkeys(
+                        str(s.get("display_color") or s.get("color"))
+                        for s in spec if s.get("display_color") or s.get("color")))
+                    log(f"      VLM 矢量曲线清单: {len(spec)} 条（几何路径将逐实例匹配，不按颜色合并）",
+                        detail=True)
+                    for s in spec:
+                        log(f"        - {str(s.get('label'))[:28]} 颜色={s.get('color')} "
+                            f"锚点={len(s.get('anchors') or [])}", detail=True)
+            except vlmc.VLMError as exc:
+                log(f"      VLM 矢量曲线定位失败: {exc}（仍按 PDF 物理路径分实例）")
+            except Exception as exc:  # noqa: BLE001
+                log(f"      VLM 矢量曲线定位异常: {type(exc).__name__}: {exc}")
         log(f"\n[矢量图] p{pno} bbox={reg['bbox']}  "
             f"x={entry['axis']['x']} y={entry['axis']['y']}  "
-            f"{len(res.get('series', []))} 条路径序列（直接读取，无需 OCR）")
+            f"{len(res.get('series', []))} 条路径序列（直接读取，无需 OCR）", detail=True)
         config["panels"].append(entry)
 
     for fig in exported:                     # 矢量回退图排在最前，其余是导出的位图图
@@ -1292,7 +1690,8 @@ def analyze(pdf_path, outdir, dpi=300, vlm=None, pages=None, use_ocr=None, want=
         if fig_img is None:
             continue
         caption = caption_of.get(fig_path.stem, "")
-        log(f"\n[图] {fig_path.name}  (p{page})" + (f"  ← {note}" if note else ""))
+        log(f"\n[图] {fig_path.name}  (p{page})" + (f"  ← {note}" if note else ""),
+            detail=True)
 
         # ---- 第一步就交给 VLM 判断：不是数据图就整图跳过，省掉切分与 OCR 的开销 ----
         vlm_cls, name_map = None, {}
@@ -1302,22 +1701,26 @@ def analyze(pdf_path, outdir, dpi=300, vlm=None, pages=None, use_ocr=None, want=
                     log(f"      VLM 分类: {vlm_cls.get('chart_type')}  "
                         f"子图={vlm_cls.get('panel_count')}  双Y轴={vlm_cls.get('dual_y_axis')}  "
                         f"可提取={vlm_cls.get('is_line_chart')}"
-                        f"  （{str(vlm_cls.get('reason', ''))[:40]}）")
+                        f"  （{str(vlm_cls.get('reason', ''))[:40]}）", detail=True)
                     if vlm_cls.get("is_line_chart") is False:
-                        log("      ⏭ 跳过：VLM 判定为非数据图（照片/示意图/表格），不再切分与 OCR")
+                        log("      ⏭ 跳过：VLM 判定为非数据图（照片/示意图/表格），不再切分与 OCR",
+                            detail=True)
                         continue
                     multi_y = bool(vlm_cls.get("dual_y_axis"))
                     if multi_y:
-                        log("      ⚠ 检出双 Y 轴：将为每条曲线单独指派纵轴")
+                        log("      ⚠ 检出双 Y 轴：将为每条曲线单独指派纵轴", detail=True)
                 except vlmc.VLMError as exc:
                     log(f"      VLM 分类失败: {exc}（继续走图像路线）")
 
-        legend_colors, legend_box = detect_legend_colors(fig_img)
-        log(f"      图例色: {legend_colors}")
+        legend_colors = detect_legend_colors(fig_img)
+        log(f"      图例色: {legend_colors}", detail=True)
         series_sides = {}
         series_roles = {}
         dark_info = {}
-        if vlm is not None and legend_colors:
+        # The semantic planner below already reads labels, roles, axis side,
+        # line/marker identity and exclusions in one response. Keep the older naming
+        # call only when that planner is explicitly disabled.
+        if vlm is not None and legend_colors and not find_series:
             try:
                 nm = vt.name_series(vlm, fig_path, legend_colors)
                 for s in nm.get("series", []):
@@ -1333,19 +1736,23 @@ def analyze(pdf_path, outdir, dpi=300, vlm=None, pages=None, use_ocr=None, want=
                             role = "not-data"
                         if role:
                             series_roles[col] = role
-                log("      VLM 系列命名: " + ", ".join(f"{k}->{v}" for k, v in name_map.items()))
+                log("      VLM 系列命名: " + ", ".join(f"{k}->{v}" for k, v in name_map.items()),
+                    detail=True)
                 if series_sides:
-                    log("      VLM 轴归属: " + ", ".join(f"{k}->{v}轴" for k, v in series_sides.items()))
+                    log("      VLM 轴归属: " + ", ".join(f"{k}->{v}轴" for k, v in series_sides.items()),
+                        detail=True)
                 drop = {k: v for k, v in series_roles.items()
                         if v in ("tangent", "fit", "annotation", "legend", "inset",
                                  "other", "not-data")}
                 if drop:
-                    log("      VLM 判定不提取: " + ", ".join(f"{k}({v})" for k, v in drop.items()))
+                    log("      VLM 判定不提取: " + ", ".join(f"{k}({v})" for k, v in drop.items()),
+                        detail=True)
                 dark_info = nm.get("dark_series") or {}
                 if dark_info.get("has_dark_line"):
                     log(f"      图中有深色线：{str(dark_info.get('kind') or '?')}"
                         f"（{str(dark_info.get('desc') or '')[:50]}）"
-                        " → 默认不提取；要提就在 config 里把该面板的 allow_dark 设为 true")
+                        " → 默认不提取；要提就在 config 里把该面板的 allow_dark 设为 true",
+                        detail=True)
             except vlmc.VLMError as exc:
                 log(f"      VLM 命名失败: {exc}")
 
@@ -1356,7 +1763,7 @@ def analyze(pdf_path, outdir, dpi=300, vlm=None, pages=None, use_ocr=None, want=
             panels = split_figure(fig_path, outdir / "panels")
         for idx, (panel_path, frame, box) in enumerate(panels, start=1):
             pid = f"{fig_path.stem}_p{idx}"
-            log(f"  面板 {idx}/{len(panels)}: {panel_path.name} frame={frame}")
+            log(f"  面板 {idx}/{len(panels)}: {panel_path.name} frame={frame}", detail=True)
             entry = {
                 "id": pid,
                 "page": page,
@@ -1389,7 +1796,7 @@ def analyze(pdf_path, outdir, dpi=300, vlm=None, pages=None, use_ocr=None, want=
                         + "  y=" + (", ".join(
                             f"{k}轴{[round(d['range'][0], 4), round(d['range'][1], 4)]}"
                             for k, d in y_axes.items()) or "None")
-                        + f"  置信度={va.get('confidence')}")
+                        + f"  置信度={va.get('confidence')}", detail=True)
                 except vlmc.VLMError as exc:
                     log(f"      VLM 轴读数失败: {exc}（回退 OCR）")
                 except Exception as exc:  # noqa: BLE001
@@ -1398,17 +1805,18 @@ def analyze(pdf_path, outdir, dpi=300, vlm=None, pages=None, use_ocr=None, want=
             ocr_ranges = {}
             if use_ocr:
                 try:
-                    ocr_ranges = ar.read_axis_ranges(panel_path, frame, engine=engine, log=log,
-                                                     debug_crops=outdir / "debug")
+                    ocr_ranges = ar.read_axis_ranges(
+                        panel_path, frame, engine=engine, log=detail_log,
+                        debug_crops=(outdir / "debug") if _KEEP_INTERMEDIATES else None)
                     entry["ocr"] = {k: v for k, v in ocr_ranges.items()
                                     if k in ("x", "y", "bands")}
                     ox = ocr_ranges.get("x", {}).get("range") if "x" in ocr_ranges else None
                     oy = ocr_ranges.get("y", {}).get("range") if "y" in ocr_ranges else None
-                    log(f"      OCR 对照: x={ox} y={oy}")
+                    log(f"      OCR 对照: x={ox} y={oy}", detail=True)
                 except Exception as exc:  # noqa: BLE001
                     log(f"      OCR 失败: {type(exc).__name__}: {exc}（不影响 VLM 读数）")
             else:
-                log("      OCR 已跳过（VLM 模式下默认关闭）")
+                log("      OCR 已跳过（VLM 模式下默认关闭）", detail=True)
 
             # x 轴全面板共用；y 轴以"左轴"作为面板默认值，逐条曲线再按 VLM 的归属覆盖
             for axis_key in ("x", "y"):
@@ -1442,13 +1850,15 @@ def analyze(pdf_path, outdir, dpi=300, vlm=None, pages=None, use_ocr=None, want=
                     entry["axis"]["confirmed"] = True
             log(f"      最终轴范围: x={entry['axis'].get('x')} y={entry['axis'].get('y')}"
                 f"  来源={entry.get('axis_src_x')}/{entry.get('axis_src_y')}"
-                f"  已确认={entry['axis'].get('confirmed')}")
+                f"  已确认={entry['axis'].get('confirmed')}", detail=True)
             if entry.get("y_axes") and len(entry["y_axes"]) > 1:
                 pairs = []
                 for col, side in (series_sides or {}).items():
                     detail = entry["y_axes"].get(side) or {}
                     pairs.append(f"{col}→{side}轴{detail.get('range')}")
-                log("      逐曲线轴指派: " + ("; ".join(pairs) if pairs else "（VLM 未给出归属，统一用左轴）"))
+                log("      逐曲线轴指派: "
+                    + ("; ".join(pairs) if pairs else "（VLM 未给出归属，统一用左轴）"),
+                    detail=True)
             entry["series_axes"] = series_sides
 
             # ---- 物件级判定：让模型看着编号裁图说清"哪根是哪根" ----
@@ -1461,19 +1871,26 @@ def analyze(pdf_path, outdir, dpi=300, vlm=None, pages=None, use_ocr=None, want=
                         f"{v}（{k}）" for k, v in (name_map or {}).items()
                     ) or "、".join(legend_colors)
                     found = vt.find_series(vlm, panel_path, legend_text)
-                    spec = [s for s in (found.get("series") or []) if isinstance(s, dict)]
+                    spec, ignored = _planner_series(found)
                     if spec:
                         entry["series_spec"] = spec
-                        entry["ignore"] = found.get("ignore") or []
+                        entry["extraction_plan"] = {
+                            "chart_family": found.get("chart_family"),
+                            "series_count": len(spec),
+                            "reported_series_count": found.get("series_count"),
+                            "exclude_regions": found.get("exclude_regions") or [],
+                        }
+                        entry["ignore"] = ignored
                         for s in spec:
                             a = s.get("anchors") or []
                             log(f"      模型指出曲线: {str(s.get('label'))[:26]:<26}"
-                                f" 颜色={s.get('color')} 线型={s.get('linestyle')}"
-                                f" 标记={s.get('has_markers')} 输出={s.get('output')}"
-                                f" 锚点={len(a)}")
+                                f" 线色={s.get('line_color') or s.get('color')}"
+                                f" 标记色={s.get('marker_color')} 角色={s.get('role')}"
+                                f" 画法={s.get('draw') or s.get('linestyle')}"
+                                f" 锚点={len(a)}", detail=True)
                         for ig in entry["ignore"]:
                             log(f"      模型指出忽略: {str(ig.get('what'))[:44]}"
-                                f"（{str(ig.get('why'))[:40]}）")
+                                f"（{str(ig.get('why'))[:40]}）", detail=True)
                 except vlmc.VLMError as exc:
                     log(f"      曲线定位失败: {exc}")
                 except Exception as exc:  # noqa: BLE001
@@ -1517,9 +1934,10 @@ def analyze(pdf_path, outdir, dpi=300, vlm=None, pages=None, use_ocr=None, want=
         log(f"没提取任何数据：这篇里没有匹配「{want}」的图（候选清单见上面与 report.md）。")
     elif want:
         log(f"按需求筛出 {len(keep)} 张图（其余图未处理）。可核对 report.md 里的选择依据。")
-    else:
+    elif report_usage:
         log("下一步：核对 JSON 里的 axis 数值，把 confirmed 改成 true（或用 run.py confirm），再跑 extract")
-    print_vlm_usage(vlm, "analyze", vlm_usage0)
+    if report_usage:
+        print_vlm_usage(vlm, "analyze", vlm_usage0)
     return cfg_path
 
 
@@ -1647,6 +2065,50 @@ def write_report(config, path, phase, results=None):
                 lines.append(f"  - 模型复盘：merge={rv.get('merge') or []} "
                              f"drop={rv.get('drop') or []} "
                              f"add={len(rv.get('add') or [])} ｜ {str(rv.get('note'))[:70]}")
+            params = r.get("template_params") or {}
+            if params:
+                mode = r.get("template_param_mode") or "legacy"
+                lines.append(f"- 模板参数 Agent（{r.get('template_param_calls', 0)} 次调用，"
+                             f"模式={mode}）:")
+                fallback_reason = r.get("template_param_fallback_reason")
+                if fallback_reason:
+                    lines.append(f"  - ⚠️ 论文知识链回退到旧参数读取: "
+                                 f"{str(fallback_reason)[:240]}")
+                binding = r.get("template_param_binding") or {}
+                if binding:
+                    global_conditions = binding.get("global_condition_ids") or []
+                    series_conditions = {
+                        name: value.get("condition_ids") or []
+                        for name, value in (binding.get("series") or {}).items()
+                        if isinstance(value, dict) and value.get("condition_ids")}
+                    lines.append("  - 工况绑定: global=" + str(global_conditions)
+                                 + (f"；series={series_conditions}" if series_conditions else ""))
+                added_facts = r.get("template_param_panel_facts_added") or []
+                if added_facts:
+                    lines.append("  - 当前图明确事实已写入论文知识库: "
+                                 + ", ".join(str(item) for item in added_facts))
+                evidence = r.get("template_param_evidence") or {}
+                basis = r.get("template_param_basis") or {}
+                fact_ids = r.get("template_param_fact_ids") or {}
+                raw_values = r.get("template_param_raw") or {}
+                conflicts = r.get("template_param_conflicts") or {}
+                for name, kv in params.items():
+                    values = "；".join(f"{k}={v}" for k, v in kv.items() if v not in (None, ""))
+                    lines.append(f"  - {name}: {values or '未找到可唯一归属的参数'}")
+                    for key, quote in (evidence.get(name) or {}).items():
+                        how = (basis.get(name) or {}).get(key)
+                        fact_id = (fact_ids.get(name) or {}).get(key)
+                        raw = (raw_values.get(name) or {}).get(key) or {}
+                        raw_text = " ".join(str(raw.get(part) or "").strip()
+                                            for part in ("value", "unit")).strip()
+                        tags = [item for item in (how,
+                                                  f"fact={fact_id}" if fact_id else "",
+                                                  f"raw={raw_text}" if raw_text else "") if item]
+                        tag_text = f" [{', '.join(tags)}]" if tags else ""
+                        lines.append(f"    - {key}{tag_text}: {str(quote)[:180]}")
+                    for key, competing in (conflicts.get(name) or {}).items():
+                        lines.append(f"    - ⚠️ {key} 换算后仍有冲突，已留空: "
+                                     + ", ".join(str(item) for item in competing))
             lines.append(f"- 质检图: `verify/{p['id']}_verify.png`")
         lines.append("")
     Path(path).write_text("\n".join(lines), encoding="utf-8")
@@ -1662,23 +2124,23 @@ def make_verify_image(panel_path, frame, axis, legend_colors, series_files, out_
     # 模型指出了但代码没追到的曲线：把它的锚点圈出来，肉眼即可判断是模型错还是代码错
     marks = []
     if failed:
-        img = iio.imread(panel_path)
-        if img is not None:
-            w, h = img.shape[1], img.shape[0]
-            for f in failed:
-                for a in (f.get("anchors") or []):
-                    try:
-                        x, y = float(a[0]) * w, float(a[1]) * h
-                    except (TypeError, ValueError, IndexError):
-                        continue
-                    marks.append(([int(x) - 10, int(y) - 10, int(x) + 10, int(y) + 10],
-                                  f"missed:{str(f.get('label'))[:12]}"))
+        left, top, right, bottom = (float(v) for v in frame)
+        for f in failed:
+            for a in (f.get("anchors") or []):
+                try:
+                    x = left + float(a[0]) * (right - left)
+                    y = bottom - float(a[1]) * (bottom - top)
+                except (TypeError, ValueError, IndexError):
+                    continue
+                marks.append(([int(x) - 10, int(y) - 10, int(x) + 10, int(y) + 10],
+                              f"missed:{str(f.get('label'))[:12]}"))
     vo.compose_overlay(panel_path, frame, tuple(axis["x"]), tuple(axis["y"]),
                        series, out_path, annotations=marks, anchors=anchors,
                        bridged=bridged)
 
 
-def _write_template_output(fmt, res, panel, panel_path, csv_dir, outdir, vlm, log):
+def _write_template_output(fmt, res, panel, panel_path, csv_dir, outdir, vlm, log,
+                           paper_path=None, param_state=None):
     """把这一面板的曲线按用户模板再输出一份（模板代码由模型写一次，之后复用）。"""
     # 同一个系列可能有两个文件（标记点 + 线）：模板里一条曲线只该出现一次，
     # 取**线**（它包含被遮挡段补出来的点）；只出点的那种取点。
@@ -1695,7 +2157,7 @@ def _write_template_output(fmt, res, panel, panel_path, csv_dir, outdir, vlm, lo
                                    "params": {}})
     series = [v[1] for v in picked.values()]
     if not series:
-        return
+        return []
     context = {"paper": panel_path.parent.parent.name, "panel": panel["id"],
                "ext": fmt.ext, "template": fmt.name}
     # 模板声明的参数 + 代码实际用到的参数（模型有时只列了"按曲线"的那部分，
@@ -1703,8 +2165,38 @@ def _write_template_output(fmt, res, panel, panel_path, csv_dir, outdir, vlm, lo
     keys = list(dict.fromkeys(fmt.params + tpl.probe_params(fmt, series, context)))
     vals = {}
     if keys:
-        vals = tpl.ask_params(vlm, panel_path, panel.get("caption"), series, keys,
-                             hints=tpl.params_hints(fmt, keys))
+        evidence = tpl.paper_param_context(
+            paper_path, page=panel.get("page"), caption=panel.get("caption") or "", keys=keys)
+        param_answer = tpl.ask_params_with_knowledge(
+            vlm, panel_path, panel.get("caption"), series, keys,
+            hints=tpl.params_hints(fmt, keys), evidence=evidence,
+            paper_path=paper_path,
+            knowledge_cache=Path(outdir) / "condition_knowledge.json",
+            state=param_state, return_meta=True)
+        # Keep the rendering path tolerant of third-party/older parameter agents
+        # that still return only the values mapping.  Metadata is additive and must
+        # never prevent a template file from being produced.
+        if (isinstance(param_answer, tuple) and len(param_answer) == 2
+                and isinstance(param_answer[0], dict)):
+            vals, param_meta = param_answer
+        else:
+            vals = param_answer if isinstance(param_answer, dict) else {}
+            param_meta = {"evidence": {}, "basis": {}, "calls": 0}
+        res["template_params"] = vals
+        res["template_param_evidence"] = param_meta.get("evidence") or {}
+        res["template_param_basis"] = param_meta.get("basis") or {}
+        res["template_param_calls"] = int(param_meta.get("calls") or 0)
+        res["template_param_mode"] = param_meta.get("mode") or "legacy"
+        res["template_param_binding"] = param_meta.get("binding") or {}
+        res["template_param_fact_ids"] = param_meta.get("fact_ids") or {}
+        res["template_param_raw"] = param_meta.get("raw") or {}
+        res["template_param_conflicts"] = param_meta.get("conflicts") or {}
+        res["template_param_panel_facts_added"] = param_meta.get("panel_facts_added") or []
+        res["template_param_fallback_reason"] = param_meta.get("fallback_reason") or ""
+        n_filled = sum(1 for by_series in vals.values() for v in by_series.values()
+                       if v not in (None, ""))
+        log(f"      参数 Agent：填出 {n_filled}/{len(series) * len(keys)} 项"
+            f"（{res['template_param_calls']} 次调用）")
     for item in series:
         item["params"] = {k: str((vals.get(item["name"]) or {}).get(k, "")) for k in keys}
     try:
@@ -1732,32 +2224,55 @@ def _write_template_output(fmt, res, panel, panel_path, csv_dir, outdir, vlm, lo
                 + "，渲染继续）")
         except Exception as exc2:  # noqa: BLE001
             log(f"      （模板渲染失败，跳过：{type(exc2).__name__}: {exc2}）")
-            return
+            return []
     dest = Path(outdir) / "templates" / Path(str(fmt.name)).stem
     for fname, text in files.items():
         p = dest / Path(str(fname)).name               # 只取文件名，防目录穿越
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(str(text), encoding="utf-8")
     log(f"      模板输出 {len(files)} 个文件 -> {dest}")
+    return [Path(str(fname)).name for fname in files]
 
 
-def extract(cfg_path, force=False, only=None, vlm=None, template=None):
+def extract(cfg_path, force=False, only=None, vlm=None, template=None, report_usage=True):
     """template: 文件路径 = 用这个模板；None = 沿用上次的模板；False = 不用模板（只出 CSV）。"""
     t0 = time.time()
     cfg_path = Path(cfg_path).resolve()
     config = json.loads(cfg_path.read_text(encoding="utf-8"))
     vlm_usage0 = dict(vlm.usage) if vlm is not None else None
     outdir = Path(config.get("outdir") or cfg_path.parent)
+    _clean_stale_intermediates(outdir)
     csv_dir = outdir / "csv"
     verify_dir = outdir / "verify"
     csv_dir.mkdir(parents=True, exist_ok=True)
     verify_dir.mkdir(parents=True, exist_ok=True)
+    old_results = {}
+    old_results_path = outdir / "extract_results.json"
+    if old_results_path.exists():
+        try:
+            old_results = json.loads(old_results_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            old_results = {}
     fmt = None
+    param_state = {}
     if template is not False:
         try:
-            fmt = tpl.load(template, vlm=vlm, log=log)
+            fmt = tpl.load(template, vlm=vlm, log=detail_log)
         except Exception as exc:  # noqa: BLE001 - 模板不可用不该拖垮提取
             log(f"      （模板不可用，只出 CSV：{type(exc).__name__}: {exc}）")
+
+    if fmt:
+        template_dir = outdir / "templates" / Path(str(fmt.name)).stem
+        if not only:
+            for f in template_dir.glob("*") if template_dir.exists() else []:
+                if f.is_file():
+                    f.unlink()
+        else:
+            for panel_id in only:
+                for name in (old_results.get(panel_id) or {}).get("template_files") or []:
+                    target = template_dir / Path(str(name)).name
+                    if target.is_file():
+                        target.unlink()
 
     # 重跑时先清掉这次要覆盖的旧产物：否则新旧结果混在一个目录里，
     # 分不清哪个 CSV 是这一次的（实测把这批论文重跑时踩到过）
@@ -1770,7 +2285,11 @@ def extract(cfg_path, force=False, only=None, vlm=None, template=None):
         for p in config["panels"]:
             if p["id"] not in only:
                 continue
-            stem = Path(p.get("panel_image") or "").stem
+            # Bitmap panels are keyed by their image stem; vector panels have no
+            # panel_image and write files with the panel id directly.  Falling back
+            # to the id is essential here, otherwise a targeted vector rerun leaves
+            # obsolete CSVs from the previous extraction beside the new result.
+            stem = Path(p.get("panel_image") or "").stem or str(p.get("id") or "")
             for d in (csv_dir, verify_dir):
                 for f in list(d.glob(f"{stem}*")) if stem else []:
                     f.unlink()
@@ -1790,28 +2309,34 @@ def extract(cfg_path, force=False, only=None, vlm=None, template=None):
             if pdf_doc is None:
                 pdf_doc = tp.pdfplumber.open(config["pdf"])
             page = pdf_doc.pages[p["page"] - 1]
-            vres = vx.extract_vector_figure(page, tuple(p["vector_bbox"]), csv_dir, p["id"])
+            vres = vx.extract_vector_figure(page, tuple(p["vector_bbox"]), csv_dir, p["id"],
+                                            series_spec=p.get("series_spec"))
             series = [{
                 "file": s["file"], "points": s["n_points"], "color": s["color"],
+                "series_name": s.get("series_name"), "source": s.get("source"),
                 "x_range": [round(v, 6) for v in s["x_range"]],
                 "y_range": [round(v, 6) for v in s["y_range"]],
             } for s in vres.get("series", [])]
             results[p["id"]] = {"series": series, "method": "vector",
                                 "frame": vres.get("axes"), "axis_range": ax}
             log(f"{p['id']} [矢量·直接读取]: {len(series)} 条曲线")
+            crop_path = outdir / "figures" / f"{p['id']}.png"
             try:
                 scale = 300 / 72.0
                 bbox = p["vector_bbox"]
-                page.crop(tuple(bbox), strict=False).to_image(resolution=300).original.save(
-                    outdir / "figures" / f"{p['id']}.png")
+                page.crop(tuple(bbox), strict=False).to_image(resolution=300).original.save(crop_path)
                 frame_c = [(p["frame"][0] - bbox[0]) * scale, (p["frame"][1] - bbox[1]) * scale,
                            (p["frame"][2] - bbox[0]) * scale, (p["frame"][3] - bbox[1]) * scale]
-                make_verify_image(outdir / "figures" / f"{p['id']}.png", frame_c, ax,
+                make_verify_image(crop_path, frame_c, ax,
                                   [s["color"] for s in series],
                                   [csv_dir / s["file"] for s in series],
                                   verify_dir / f"{p['id']}_verify.png")
             except Exception as exc:  # noqa: BLE001
                 log(f"      （质检图渲染失败：{type(exc).__name__}: {exc}）")
+            if fmt and series and crop_path.exists():
+                results[p["id"]]["template_files"] = _write_template_output(
+                    fmt, results[p["id"]], p, crop_path, csv_dir, outdir,
+                    vlm, log, paper_path=config.get("pdf"), param_state=param_state)
             continue
 
         if not (ax.get("confirmed") or force):
@@ -1871,7 +2396,8 @@ def extract(cfg_path, force=False, only=None, vlm=None, template=None):
                     f.unlink()
                 res2 = _extract_panel(p, panel_path, new_rng, csv_dir)
                 if res2:
-                    log(f"      轴映射按模型复盘修正：{rng} -> {new_rng}，已重跑该面板")
+                    log(f"      轴映射按模型复盘修正：{rng} -> {new_rng}，已重跑该面板",
+                        detail=True)
                     res2["axis_range"] = new_rng
                     res2["axis_fix"] = fix
                     res = res2
@@ -1880,35 +2406,26 @@ def extract(cfg_path, force=False, only=None, vlm=None, template=None):
         results[p["id"]] = res
         log(f"{p['id']}: {len(res.get('series', []))} 条曲线"
             + (f"  方式={'锚点+追踪' if res.get('method') == 'seeded' else '颜色追踪'}"
-               if res.get("series") else ""))
+               if res.get("series") else ""), detail=True)
         for f in res.get("failed") or []:
-            log(f"      ✗ 未追到：{str(f.get('label'))[:30]}（{str(f.get('reason'))[:60]}）")
+            log(f"      ✗ 未追到：{str(f.get('label'))[:30]}（{str(f.get('reason'))[:60]}）",
+                detail=True)
         if fmt and res.get("series"):
-            _write_template_output(fmt, res, p, panel_path, csv_dir, outdir, vlm, log)
+            res["template_files"] = _write_template_output(
+                fmt, res, p, panel_path, csv_dir, outdir, vlm, log,
+                paper_path=config.get("pdf"), param_state=param_state)
         if res.get("series"):
             files = [csv_dir / s["file"] for s in res["series"]]
-            colors, anchors = [], []
-            panel_img = iio.imread(panel_path)
-            panel_h, panel_w = (panel_img.shape[0], panel_img.shape[1]) \
-                if panel_img is not None else (0, 0)
+            colors = []
             for s in res["series"]:
                 hexs = s.get("color_hex")
                 if not hexs and s.get("target_bgr"):
                     hexs = "#{:02x}{:02x}{:02x}".format(
                         s["target_bgr"][2], s["target_bgr"][1], s["target_bgr"][0])
                 colors.append(hexs or "#ff00ff")
-                # 模型给的锚点画成十字：锚点不在线上 = 模型没指准；锚点在线上而数据
-                # 没追上来 = 追踪器的问题。QA 时一眼分得清是哪个环节坏了。
-                if s.get("anchors") and panel_w:
-                    for a in s["anchors"]:
-                        try:
-                            anchors.append((float(a[0]) * panel_w, float(a[1]) * panel_h,
-                                            str(s.get("series_name"))[:12]))
-                        except (TypeError, ValueError, IndexError):
-                            continue
             make_verify_image(panel_path, res["frame"], ax, colors, files,
                               verify_dir / f"{p['id']}_verify.png",
-                              failed=res.get("failed"), anchors=anchors,
+                              failed=res.get("failed"), anchors=None,
                               bridged=res.get("_bridged_px"))
 
         # ---- VLM spot check: independent re-reading of a few points ----
@@ -1916,9 +2433,7 @@ def extract(cfg_path, force=False, only=None, vlm=None, template=None):
             try:
                 # Positions are described visually (not as our computed x values) so the
                 # model's reading is a genuinely independent cross-check of the mapping.
-                spots = [("横轴最左端（x 最小值处）", 0.0),
-                         ("横轴正中间", 0.5),
-                         ("横轴最右端（x 最大值处）", 1.0)]
+                spots = [0.0, 0.5, 1.0]
                 queries, expected = [], {}
                 qid = 0
                 for s in res["series"][:2]:
@@ -1927,7 +2442,7 @@ def extract(cfg_path, force=False, only=None, vlm=None, template=None):
                         continue
                     rng = s.get("y_axis_range")
                     s_tol = tol_by_range.get(tuple(rng)) if rng else None
-                    for where, frac in spots:
+                    for frac in spots:
                         qid += 1
                         target = xs[0] + frac * (xs[-1] - xs[0])
                         i = min(range(len(xs)), key=lambda k: abs(xs[k] - target))
@@ -1935,7 +2450,7 @@ def extract(cfg_path, force=False, only=None, vlm=None, template=None):
                         hexs = ("#{:02x}{:02x}{:02x}".format(bgr[2], bgr[1], bgr[0])).upper() \
                             if bgr else None
                         side = (p.get("series_axes") or {}).get(hexs) if hexs else None
-                        queries.append({"id": qid, "where": where, "tol": s_tol,
+                        queries.append({"id": qid, "x": target, "tol": s_tol,
                                         "axis": side if len(p.get("y_axes") or {}) > 1 else None,
                                         "series": s.get("series_name") or s.get("label")})
                         expected[qid] = ys[i]
@@ -1943,7 +2458,10 @@ def extract(cfg_path, force=False, only=None, vlm=None, template=None):
                     raw = vt.spot_check(vlm, panel_path, queries)
                     # tolerance from the chart's own tick spacing, not a % of the range
                     step = None
-                    for src in (p.get("ocr", {}).get("y"), (p.get("vlm_axis") or {}).get("y")):
+                    axis_sources = [p.get("ocr", {}).get("y"),
+                                    (p.get("vlm_axis") or {}).get("y")]
+                    axis_sources.extend((p.get("y_axes") or {}).values())
+                    for src in axis_sources:
                         if isinstance(src, dict) and src.get("step"):
                             step = abs(src["step"]) if step is None else min(step, abs(src["step"]))
                         labels = (src or {}).get("labels") if isinstance(src, dict) else None
@@ -1961,11 +2479,18 @@ def extract(cfg_path, force=False, only=None, vlm=None, template=None):
                     log(f"      VLM 抽查: {cmp['n_agree']}/{cmp['n_compared']} 一致"
                         f"（容差 ±{'/'.join(f'{t:g}' for t in tols) or f'{tol:g}'}）"
                         + (f"  ⚠ 存在不一致" if cmp["n_compared"] and
-                           cmp["n_agree"] < cmp["n_compared"] else ""))
+                           cmp["n_agree"] < cmp["n_compared"] else ""), detail=True)
             except vlmc.VLMError as exc:
                 log(f"      VLM 抽查失败: {exc}")
             except Exception as exc:  # noqa: BLE001
                 log(f"      VLM 抽查异常: {type(exc).__name__}: {exc}")
+
+        failed_n = len(res.get("failed") or [])
+        spot = res.get("spot_check") or {}
+        spot_text = (f"，抽查 {spot.get('n_agree', 0)}/{spot.get('n_compared', 0)}"
+                     if spot else "")
+        log(f"{p['id']}: {len(res.get('series', []))} 条曲线，"
+            f"{failed_n} 条未追到{spot_text}")
 
     for r in results.values():                 # 私有字段（像素轨迹）不进 JSON
         for k in [k for k in r if k.startswith("_")]:
@@ -1976,10 +2501,10 @@ def extract(cfg_path, force=False, only=None, vlm=None, template=None):
         pdf_doc.close()
     write_report(config, outdir / "report.md", phase="extract", results=results)
     total = sum(len(r.get("series", [])) for r in results.values())
-    log(f"\n共提取 {total} 条曲线，耗时 {_elapsed(t0)} -> {csv_dir}")
-    log(f"质检图 -> {verify_dir}")
-    log(f"报告 -> {outdir / 'report.md'}")
-    print_vlm_usage(vlm, "extract", vlm_usage0)
+    log(f"完成：{total} 条曲线，耗时 {_elapsed(t0)}；CSV={csv_dir}；"
+        f"质检图={verify_dir}；报告={outdir / 'report.md'}")
+    if report_usage:
+        print_vlm_usage(vlm, "extract", vlm_usage0)
     return results
 
 
@@ -1987,13 +2512,13 @@ def _run_one(pdf, sub, row, dpi, pages, force, vlm, use_ocr, want=None, want_dee
              find_series=True, template=None):
     """One PDF end-to-end (analyze + extract). Shared by serial and parallel batch."""
     cfg = analyze(pdf, sub, dpi=dpi, vlm=vlm, pages=pages, use_ocr=use_ocr, want=want,
-                  want_deep=want_deep, find_series=find_series)
+                  want_deep=want_deep, find_series=find_series, report_usage=False)
     config = json.loads(Path(cfg).read_text(encoding="utf-8"))
     if config.get("selection"):
         row["matched"] = len(config["selection"].get("ids") or [])
     row["panels"] = len([p for p in config["panels"] if not p.get("skip")])
     row["panels_skipped"] = len([p for p in config["panels"] if p.get("skip")])
-    results = extract(cfg, force=force, vlm=vlm, template=template) or {}
+    results = extract(cfg, force=force, vlm=vlm, template=template, report_usage=False) or {}
     row["curves"] = sum(len(r.get("series", [])) for r in results.values())
     for r in results.values():
         sc = r.get("spot_check") or {}
@@ -2019,14 +2544,17 @@ def _log_row(row, with_vlm):
 
 
 def _batch_one(pdf_str, sub_str, dpi, pages, force, vlm_spec, use_ocr, want=None,
-               want_deep=False, find_series=True, template=None):
+               want_deep=False, find_series=True, template=None,
+               verbose=False, keep_intermediates=False):
     """Worker body for --jobs > 1: one PDF per process.
 
     Output goes to that paper's own run.log - several processes printing to one terminal
     interleaves into unreadable text. VLM usage is returned with the row and summed by
     the parent, because a client built in a child cannot report back through pickling.
     """
-    global _LOG_FILE
+    global _LOG_FILE, _VERBOSE, _KEEP_INTERMEDIATES
+    _VERBOSE = bool(verbose)
+    _KEEP_INTERMEDIATES = bool(keep_intermediates)
     pdf, sub = Path(pdf_str), Path(sub_str)
     sub.mkdir(parents=True, exist_ok=True)
     row = new_row(pdf, sub)
@@ -2038,7 +2566,8 @@ def _batch_one(pdf_str, sub_str, dpi, pages, force, vlm_spec, use_ocr, want=None
                                       base_url=vlm_spec["base_url"])
             if not client.api_key:
                 client = None
-        _LOG_FILE = (sub / "run.log").open("w", encoding="utf-8")
+        _LOG_FILE = ((sub / "run.log").open("w", encoding="utf-8")
+                     if _VERBOSE else io.StringIO())
         _run_one(pdf, sub, row, dpi, pages, force, client, use_ocr, want, want_deep,
                  find_series, template)
     except Exception as exc:  # noqa: BLE001
@@ -2091,7 +2620,8 @@ def _batch_parallel(pdfs, outdir, jobs, dpi, pages, force, vlm, use_ocr, want=No
     with ProcessPoolExecutor(max_workers=jobs) as ex:
         futures = {ex.submit(_batch_one, str(pdf), str(outdir / pdf.stem), dpi, pages,
                              force, spec, use_ocr, want, want_deep,
-                             find_series, template): pdf for pdf in pdfs}
+                             find_series, template, _VERBOSE,
+                             _KEEP_INTERMEDIATES): pdf for pdf in pdfs}
         for fut in as_completed(futures):
             pdf = futures[fut]
             done += 1
@@ -2214,8 +2744,15 @@ def confirm(cfg_path, panel_id, x, y, skip=False):
 
 
 def main():
+    global _VERBOSE, _KEEP_INTERMEDIATES
     ap = argparse.ArgumentParser(description="PDF -> 图表数据 端到端流水线")
     sub = ap.add_subparsers(dest="cmd", required=True)
+
+    def add_runtime_flags(parser):
+        parser.add_argument("--verbose", action="store_true",
+                            help="打印逐图、逐曲线与 VLM 用量明细")
+        parser.add_argument("--keep-intermediates", action="store_true",
+                            help="保留 gaps/review/debug/select 等诊断中间文件")
 
     a = sub.add_parser("analyze", help="PDF -> 图片/面板/图例色/OCR 轴范围 + 配置")
     a.add_argument("pdf")
@@ -2236,6 +2773,7 @@ def main():
                    help="再用正文里提到图的段落判定一次（更准，每篇约 ¥0.02）")
     a.add_argument("--no-find-series", action="store_true",
                    help="不让模型找曲线（省掉每面板一次调用，但就不知道该提哪几条线）")
+    add_runtime_flags(a)
 
     e = sub.add_parser("extract", help="按配置提取数据（只跑已确认的面板）")
     e.add_argument("config")
@@ -2247,6 +2785,7 @@ def main():
     e.add_argument("--template", default=None,
                    help="按这个模板文件（txt/dat 等）再输出一份；模型只读一次即缓存")
     e.add_argument("--no-template", action="store_true", help="不用模板（只出 CSV）")
+    add_runtime_flags(e)
 
     c = sub.add_parser("confirm", help="确认/修正某个面板的轴范围")
     c.add_argument("config")
@@ -2272,6 +2811,7 @@ def main():
     al.add_argument("--template", default=None,
                     help="按这个模板文件（txt/dat 等）再输出一份；模型只读一次即缓存")
     al.add_argument("--no-template", action="store_true", help="不用模板（只出 CSV）")
+    add_runtime_flags(al)
 
     b = sub.add_parser("batch", help="批量处理一个目录下的所有 PDF，并输出汇总")
     b.add_argument("dir")
@@ -2295,16 +2835,19 @@ def main():
     b.add_argument("--template", default=None,
                    help="按这个模板文件（txt/dat 等）再输出一份；模型只读一次即缓存")
     b.add_argument("--no-template", action="store_true", help="不用模板（只出 CSV）")
+    add_runtime_flags(b)
 
     sub.add_parser("doctor", help="环境自检：解释器、依赖、API key")
 
     args = ap.parse_args()
+    _VERBOSE = bool(getattr(args, "verbose", False))
+    _KEEP_INTERMEDIATES = bool(getattr(args, "keep_intermediates", False))
 
     def make_vlm():
         if not getattr(args, "vlm", False):
             return None
         client = vlmc.DeepSeekVLM(model=args.vlm_model, base_url=args.vlm_base_url,
-                                  verbose=True)
+                                  verbose=_VERBOSE)
         if not client.api_key:
             log("⚠ 指定了 --vlm 但没找到 API key："
                 "请把 key 写入项目根目录的 deepseek_key.txt 或设置 DEEPSEEK_API_KEY。"
@@ -2342,9 +2885,10 @@ def main():
         client = make_vlm()
         cfg = analyze(args.pdf, args.out, args.dpi, vlm=client, pages=args.pages,
                       use_ocr=use_ocr(), want=args.want, want_deep=args.want_deep,
-                      find_series=not args.no_find_series)
+                      find_series=not args.no_find_series, report_usage=False)
         extract(cfg, force=args.force, vlm=client,
-                template=False if args.no_template else args.template)
+                template=False if args.no_template else args.template,
+                report_usage=False)
         if client is not None:
             print_vlm_usage(client, "本次合计")
     elif args.cmd == "batch":

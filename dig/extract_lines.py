@@ -428,10 +428,9 @@ def color_mask(hsv, frame, target_bgr, hue_tol=14, sat_frac=0.45, min_sat=45,
                val_frac=0.25, exclude_boxes=()):
     """Pixels belonging to a legend colour, clipped to the plot area.
 
-    `exclude_boxes` 里可以混着两类：4 元组 (x, y, w, h) 一律清掉；5 元组
-    (x, y, w, h, "#rrggbb") 是图例色块窄带。窄带只有十几像素高，穿过去的曲线最多
-    掉几列（追踪器自己会跨过去），所以按颜色过滤没有意义——实测图例里两条相近颜色
-    的样本会互相漏掉（2014-01-9079 图 14 的橙色样本被当成了一条平线数据）。
+    `exclude_boxes` are hard forbidden regions such as legends and insets.  Their
+    contents are semantic annotations, never measured pixels; hidden data is repaired
+    separately rather than inferred from legend samples.
     """
     th, ts, tv = bgr_to_hsv(target_bgr)
     boxes = []
@@ -528,11 +527,6 @@ def _clip_and_mask(mask, frame, exclude_boxes):
     fw, fh = max(1, right - left), max(1, bottom - top)
     for box in exclude_boxes:
         x, y, w, h = (int(v) for v in box[:4])
-        if h <= 20:
-            # 图例色块的窄带（见 batch_extract.legend_boxes）：只清这一条。图例框
-            # 常常压在数据曲线上，把整框连"框外一圈小碎块"一起清掉会抹掉真实数据。
-            mask[max(0, y - 2):y + h + 2, max(0, x - 2):x + w + 2] = 0
-            continue
         mask[max(0, y - 3):y + h + 3, max(0, x - 3):x + w + 3] = 0
         # 图例框 / 放大子图的**刻度文字**常画在框外一圈（inset 的 70/60/50 就标在
         # 框左边约 40px 处），只清框内救不了它们。所以再清掉框周围一圈里的

@@ -40,7 +40,7 @@ def main():
     client = vc.DeepSeekVLM(api_key="sk-mock", base_url=f"http://127.0.0.1:{port}",
                             model="deepseek-flash", verbose=True)
     print("=" * 70)
-    print("阶段 1: analyze（VLM 分类 + 轴读数交叉核对 + 系列命名）")
+    print("阶段 1: analyze（VLM 分类 + 轴读数 + 语义规划）")
     print("=" * 70)
     cfg = wpd_run.analyze(pdf, out, dpi=300, vlm=client, pages=page)
 
@@ -51,8 +51,9 @@ def main():
               f"轴x={p['axis'].get('x')} y={p['axis'].get('y')} "
               f"confirmed={p['axis'].get('confirmed')} "
               f"来源={p.get('axis_src_x')}/{p.get('axis_src_y')}")
-        if p.get("series_names"):
-            print(f"      系列命名: {p['series_names']}")
+        if p.get("series_spec"):
+            print("      语义系列: " + ", ".join(
+                str(s.get("label") or "?") for s in p["series_spec"]))
         if p.get("notes"):
             print(f"      备注: {p['notes']}")
 

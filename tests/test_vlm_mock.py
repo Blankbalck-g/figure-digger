@@ -88,6 +88,13 @@ def main():
         print(f"找不到测试图 {image}")
         return 1
 
+    prod = vc.DeepSeekVLM(api_key="unused", base_url="https://api.deepseek.com")
+    mock = vc.DeepSeekVLM(api_key="unused", base_url="http://127.0.0.1:9")
+    key_args = ("same-image", "same prompt", None, True, 1024, 0.0)
+    assert prod._cache_key(*key_args) != mock._cache_key(*key_args), \
+        "真实端点与 mock 端点不能共用缓存键"
+    print("缓存命名空间: 真实 API 与本地 mock 已隔离 ✓")
+
     srv = HTTPServer(("127.0.0.1", 0), Handler)
     port = srv.server_address[1]
     threading.Thread(target=srv.serve_forever, daemon=True).start()
@@ -103,7 +110,9 @@ def main():
           "| is_line_chart =", vt.classify_chart(vlm, image).get("is_line_chart"))
     print("[2] 轴范围")
     ax = vt.read_axis_ranges(vlm, image, hint="x=[0,5] y=[0,70]")
-    print(f"    x={ax['x']['min']}~{ax['x']['max']}  y={ax['y']['min']}~{ax['y']['max']}"
+    y_axis = ax.get("y") or (ax.get("y_axes") or [{}])[0]
+    print(f"    x={ax['x']['min']}~{ax['x']['max']}  "
+          f"y={y_axis['min']}~{y_axis['max']}"
           f"  confidence={ax.get('confidence')}")
     print("[3] 系列命名")
     names = vt.name_series(vlm, image, ["#053856", "#8a532d"])

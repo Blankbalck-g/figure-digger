@@ -22,6 +22,7 @@
 """
 
 import csv
+import math
 import re
 from pathlib import Path
 
@@ -71,8 +72,14 @@ def write_csv(path, data):
 
 
 def anchors_to_pixels(anchors, frame, size):
-    """Normalised [x, y] from the model -> pixel coordinates inside the panel image."""
-    w, h = size
+    """Plot-normalised ``[x, y]`` -> image pixels.
+
+    Agent prompts use Cartesian plot coordinates: (0, 0) is the lower-left and
+    (1, 1) the upper-right of the plotting rectangle.  They are not image coordinates
+    over the surrounding panel that also contains labels, ticks and legends.
+    """
+    _w, _h = size  # retained in the public signature for existing callers
+    left, top, right, bottom = (float(v) for v in frame)
     out = []
     for a in anchors or []:
         try:
@@ -80,7 +87,36 @@ def anchors_to_pixels(anchors, frame, size):
         except (TypeError, ValueError, IndexError):
             continue
         if 0.0 <= x <= 1.0 and 0.0 <= y <= 1.0:
-            out.append((x * w, y * h))
+            out.append((left + x * (right - left), bottom - y * (bottom - top)))
+    return out
+
+
+def data_anchors_to_pixels(anchors, frame, data_range):
+    """Data-coordinate repair anchors -> pixels inside ``frame``.
+
+    The critic sees the re-plotted numeric axes and is deliberately asked for actual
+    data values.  This inverse of ``extract_lines.to_data`` keeps that semantic output
+    separate from the planner's coarse plot-normalised locations.
+    """
+    left, top, right, bottom = (float(v) for v in frame)
+    xmin, xmax, ymin, ymax = (float(v) for v in data_range)
+    if xmax == xmin or ymax == ymin:
+        return []
+    out = []
+    for a in anchors or []:
+        try:
+            x, y = float(a[0]), float(a[1])
+        except (TypeError, ValueError, IndexError):
+            continue
+        if not (math.isfinite(x) and math.isfinite(y)):
+            continue
+        # A small tolerance absorbs visual reading at the first/last tick, but gross
+        # hallucinations remain rejected instead of creating out-of-frame data.
+        xtol, ytol = 0.02 * abs(xmax - xmin), 0.02 * abs(ymax - ymin)
+        if xmin - xtol <= x <= xmax + xtol and ymin - ytol <= y <= ymax + ytol:
+            px = left + (x - xmin) * (right - left) / (xmax - xmin)
+            py = top + (ymax - y) * (bottom - top) / (ymax - ymin)
+            out.append((px, py))
     return out
 
 
@@ -979,6 +1015,93 @@ def complete_trace(trace, mask, frame, occluders=(), max_jump=MAX_JUMP, max_gap=
     return out, info
 
 
+def marker_centers(mask, min_markers=3):
+    """Marker centres from a mask whose non-data regions were already excluded."""
+    m = mask
+    if int((m > 0).sum()) < 60:
+        return []
+    eroded = cv2.erode(m, np.ones((5, 5), np.uint8))
+    n, labels, stats, cents = cv2.connectedComponentsWithStats(eroded)
+    blobs = []
+    h_img, w_img = mask.shape[:2]
+    max_dim = max(12, int(0.08 * min(h_img, w_img)))
+    for i in range(1, n):
+        if stats[i, cv2.CC_STAT_AREA] < 3:
+            continue
+        bw = int(stats[i, cv2.CC_STAT_WIDTH])
+        bh = int(stats[i, cv2.CC_STAT_HEIGHT])
+        if max(bw, bh) > max_dim or max(bw, bh) > 3.0 * max(1, min(bw, bh)):
+            continue
+        blobs.append({"cx": float(cents[i][0]), "cy": float(cents[i][1]),
+                      "w": bw, "h": bh,
+                      "area": int(stats[i, cv2.CC_STAT_AREA])})
+    if len(blobs) < min_markers:
+        return []
+    areas = np.array([b["area"] for b in blobs], float)
+    med = float(np.median(areas))
+    keep = [b for b in blobs if 0.35 * med <= b["area"] <= 3.0 * med]
+    keep.sort(key=lambda b: b["cx"])
+    return [(b["cx"], b["cy"]) for b in keep]
+
+
+def best_marker_track(points, frame, min_points=4, min_extent_frac=0.15):
+    """Pick one smooth left-to-right data trajectory from marker centres.
+
+    Legends and annotations often contain one glyph with exactly the same colour and
+    shape as the data.  A naive x-sort inserts that glyph as a huge down/up spike.
+    Dynamic programming over the last two points rewards a long physical trajectory
+    while penalising abrupt slope changes and reversals.
+    """
+    if len(points) < min_points:
+        return []
+    left, top, right, bottom = (float(v) for v in frame)
+    fw, fh = max(1.0, right - left), max(1.0, bottom - top)
+    pts = []
+    for x, y in sorted((float(x), float(y)) for x, y in points):
+        if pts and abs(x - pts[-1][0]) < 0.0025 * fw and abs(y - pts[-1][1]) < 0.02 * fh:
+            continue
+        pts.append((x, y))
+    n = len(pts)
+    min_dx, max_dx = 0.004 * fw, 0.20 * fw
+    states = {}
+    for i in range(n):
+        for j in range(i + 1, n):
+            dx = pts[j][0] - pts[i][0]
+            if dx < min_dx or dx > max_dx:
+                continue
+            if abs(pts[j][1] - pts[i][1]) > max(0.22 * fh, 4.0 * dx):
+                continue
+            states[(i, j)] = (4.0 + 0.25 * dx / fw, [i, j])
+    for j in range(1, n):
+        incoming = [(key, val) for key, val in states.items() if key[1] == j]
+        for (i, _j), (score, path) in incoming:
+            dx1 = pts[j][0] - pts[i][0]
+            s1 = ((pts[j][1] - pts[i][1]) / fh) / max(dx1 / fw, 1e-6)
+            for k in range(j + 1, n):
+                dx2 = pts[k][0] - pts[j][0]
+                if dx2 < min_dx or dx2 > max_dx:
+                    continue
+                if abs(pts[k][1] - pts[j][1]) > max(0.22 * fh, 4.0 * dx2):
+                    continue
+                s2 = ((pts[k][1] - pts[j][1]) / fh) / max(dx2 / fw, 1e-6)
+                penalty = 0.9 * min(abs(s2 - s1), 8.0)
+                if s1 * s2 < 0 and min(abs(s1), abs(s2)) > 0.15:
+                    penalty += 3.0
+                penalty += 0.25 * max(0.0, dx2 / (0.08 * fw) - 1.0)
+                new_score = score + 2.4 - penalty
+                old = states.get((j, k))
+                if old is None or new_score > old[0]:
+                    states[(j, k)] = (new_score, path + [k])
+    viable = [(score, path) for score, path in states.values()
+              if len(path) >= min_points
+              and pts[path[-1]][0] - pts[path[0]][0] >= min_extent_frac * fw]
+    if not viable:
+        return []
+    _score, path = max(viable, key=lambda v: (v[0], len(v[1]),
+                                              pts[v[1][-1]][0] - pts[v[1][0]][0]))
+    return [pts[i] for i in path]
+
+
 def markers_in_mask(mask, trace, half=22, min_markers=3):
     """标记符号的中心点（落在追踪走廊内的那些）。
 
@@ -990,26 +1113,7 @@ def markers_in_mask(mask, trace, half=22, min_markers=3):
     corridor = np.zeros((h, w), np.uint8)
     for x, y in trace:
         cv2.circle(corridor, (int(x), int(y)), half, 255, -1)
-    m = cv2.bitwise_and(mask, corridor)
-    if int((m > 0).sum()) < 60:
-        return []
-    eroded = cv2.erode(m, np.ones((5, 5), np.uint8))
-    n, labels, stats, cents = cv2.connectedComponentsWithStats(eroded)
-    blobs = []
-    for i in range(1, n):
-        if stats[i, cv2.CC_STAT_AREA] < 3:
-            continue
-        blobs.append({"cx": float(cents[i][0]), "cy": float(cents[i][1]),
-                      "w": int(stats[i, cv2.CC_STAT_WIDTH]),
-                      "h": int(stats[i, cv2.CC_STAT_HEIGHT]),
-                      "area": int(stats[i, cv2.CC_STAT_AREA])})
-    if len(blobs) < min_markers:
-        return []
-    areas = np.array([b["area"] for b in blobs], float)
-    med = float(np.median(areas))
-    keep = [b for b in blobs if 0.35 * med <= b["area"] <= 3.0 * med]
-    keep.sort(key=lambda b: b["cx"])
-    return [(b["cx"], b["cy"]) for b in keep]
+    return marker_centers(cv2.bitwise_and(mask, corridor), min_markers=min_markers)
 
 
 def markers_in_corridor(img, hsv, trace, color_bgr, half=22, min_markers=3):
@@ -1082,32 +1186,53 @@ def collapse_plateaus(trace, tol=1.0, min_run=3, min_keep=20):
 
 
 def bridge_through_anchors(trace, anchors, min_gap=3.0):
-    """把模型给的锚点插进轨迹的缺口里（按 x 排序，线性连到两侧的实测点）。
+    """把模型锚点作为控制点，在缺口内生成连续的分段线性轨迹。
 
     用于"重合处只显示一种颜色、下面那条追断了"的补全：颜色追踪只能证明"别的笔画压在
-    这里"，而模型能读出这条线在被压住的那一段往哪走。锚点只往**已有缺口**里插，不会
-    改变已经追到的部分。
+    这里"，而模型能读出这条线在被压住的那一段往哪走。实测点优先级最高；只在首尾
+    缺失区或已有长断口中，用“端点—模型锚点—端点”逐列插值。这样模型负责形状，代码
+    仍负责生成稳定、单调且可审计的像素轨迹。
     """
     pts = sorted((float(x), float(y)) for x, y in trace)
     add = sorted((float(x), float(y)) for x, y in (anchors or []))
     if not pts or not add:
         return list(trace)
-    # 缺口在两头（曲线起点之前 / 终点之后，重合处最常见）时，锚点要接到两端外面
-    out = [a for a in add if a[0] < pts[0][0] - 1.0]
+
+    def segment(controls):
+        dense = []
+        for (x0, y0), (x1, y1) in zip(controls, controls[1:]):
+            if x1 <= x0:
+                continue
+            dense.append((x0, y0))
+            dense.extend(_interp_cols(x0, y0, x1, y1))
+        if controls:
+            dense.append(controls[-1])
+        return dense
+
+    measured = {int(round(x)): (x, y) for x, y in pts}
+    inferred = {}
+
+    # Head/tail gaps have only one measured endpoint.  The model supplies the outer
+    # control points; connect them to the nearest real point.
+    head = [a for a in add if a[0] < pts[0][0] - 1.0]
+    if head:
+        for x, y in segment(head + [pts[0]]):
+            inferred[int(round(x))] = (x, y)
     tail = [a for a in add if a[0] > pts[-1][0] + 1.0]
-    ai = 0
-    for i, (x, y) in enumerate(pts):
-        out.append((x, y))
-        if i + 1 >= len(pts):
-            break
-        nx = pts[i + 1][0]
-        if nx - x < min_gap:
+    if tail:
+        for x, y in segment([pts[-1]] + tail):
+            inferred[int(round(x))] = (x, y)
+
+    # Interior anchors are accepted only inside an existing gap.  Dense interpolation
+    # stops exactly at the real endpoints, so already measured columns never move.
+    for left, right in zip(pts, pts[1:]):
+        if right[0] - left[0] < min_gap:
             continue
-        while ai < len(add) and add[ai][0] <= x:
-            ai += 1
-        j = ai
-        while j < len(add) and add[j][0] < nx:
-            out.append(add[j])
-            j += 1
-    out.extend(tail)
-    return out
+        middle = [a for a in add if left[0] < a[0] < right[0]]
+        if not middle:
+            continue
+        for x, y in segment([left] + middle + [right]):
+            inferred[int(round(x))] = (x, y)
+
+    inferred.update(measured)  # exact pixels always win
+    return [inferred[x] for x in sorted(inferred)]

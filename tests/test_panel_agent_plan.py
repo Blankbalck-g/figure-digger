@@ -1,6 +1,6 @@
 """Regression: a model-confirmed six-panel figure must never become one panel.
 
-No API key or network is used. Usage: python tests/test_panel_agent_plan.py
+No API key or network is used. Usage: python tests/test_panel_agent_plan.py <figure.png>
 """
 
 import sys
@@ -15,10 +15,13 @@ import run as app  # noqa: E402
 
 
 def main():
-    image = ROOT / "out" / "2019-01-0060" / "figures" / "2019-01-0060_p5_img1.png"
+    if len(sys.argv) < 2:
+        print("用法：python tests/test_panel_agent_plan.py <六子图图片.png>")
+        return 2
+    image = Path(sys.argv[1])
     if not image.exists():
-        print(f"跳过：缺少真实回归图 {image}")
-        return 0
+        print(f"找不到回归图片：{image}")
+        return 2
 
     plan = {"panels": [
         {"label": "150 MPa", "plot_box": [.078, .013, .511, .293]},

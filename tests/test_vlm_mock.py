@@ -3,7 +3,7 @@
 Verifies: image encoding into a data URI, OpenAI-compatible request shape, JSON-mode
 parsing, the response cache, and the four task prompts.
 
-Usage: python test_vlm_mock.py [image.png]
+Usage: python tests/test_vlm_mock.py <image.png>
 """
 
 import json
@@ -81,9 +81,10 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    image = Path(sys.argv[1]) if len(sys.argv) > 1 else (
-        ROOT / "pipeline_out" / "figures" /
-        "2023-01-1635_p7_img1.png")
+    if len(sys.argv) < 2:
+        print("用法：python tests/test_vlm_mock.py <image.png>")
+        return 2
+    image = Path(sys.argv[1])
     if not image.exists():
         print(f"找不到测试图 {image}")
         return 1

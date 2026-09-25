@@ -1,7 +1,6 @@
-"""Integration test: run the real pipeline with the VLM pointed at a local mock.
+"""Integration test against a local mock; requires a user-supplied PDF.
 
-Proves the wiring (classification gate, axis cross-check, series naming, spot check)
-without a key and without network. Usage: python test_vlm_pipeline.py <pdf> [page]
+Usage: python tests/test_vlm_pipeline.py <pdf> [page]
 """
 
 import json
@@ -28,8 +27,14 @@ for stream in (sys.stdout, sys.stderr):
 
 def main():
     here = Path(__file__).resolve().parent
-    pdf = Path(sys.argv[1]) if len(sys.argv) > 1 else (here.parent / "papers" / "2023-01-1635.pdf")
-    page = sys.argv[2] if len(sys.argv) > 2 else "7"
+    if len(sys.argv) < 2:
+        print("用法：python tests/test_vlm_pipeline.py <pdf> [page]")
+        return 2
+    pdf = Path(sys.argv[1])
+    if not pdf.is_file():
+        print(f"找不到 PDF：{pdf}")
+        return 2
+    page = sys.argv[2] if len(sys.argv) > 2 else "1"
     out = here / "vlm_test_out"
 
     srv = HTTPServer(("127.0.0.1", 0), Handler)

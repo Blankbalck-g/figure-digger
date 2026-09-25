@@ -29,9 +29,31 @@ TABLE_RE = re.compile(r"^\s*(table\s*[0-9]+)", re.IGNORECASE)
 HEADING_RE = re.compile(r"^[A-Z][A-Z0-9 ,&\-]{2,40}$")
 # 正文里提到图的句子（含 "Fig. 3"/"Figure 10"）
 FIG_MENTION_RE = re.compile(r"\bfig(?:ure)?s?\.?\s*\d+", re.IGNORECASE)
+# "Figure 3 shows..." 是正文引用，不是图注。CAPTION_RE 有意写得宽松，
+# 所以必须再分一次；否则正文证据会同时被误收进图注、又从正文摘要里删掉。
+BODY_FIGURE_REF_RE = re.compile(
+    r"^\s*fig(?:ure)?\.?\s*\d+[a-z]?\s*[)\]]?\s*"
+    r"(?:shows?|compares?|presents?|depicts?|indicates?|illustrates?|gives?|"
+    r"demonstrates?|reveals?|is|are|was|were|can|will|has|have)\b",
+    re.IGNORECASE,
+)
 
 
-def figure_mentions(page, context=1, min_chars=25):
+def is_body_figure_reference(text):
+    """Whether a line is prose beginning with a figure reference.
+
+    Journals commonly typeset the caption label as all-caps ``FIGURE 3``. Preserve
+    that strong caption signal even if the following wording happens to start with
+    a verb such as "shows".
+    """
+    m = CAPTION_RE.match(text or "")
+    if not m:
+        return False
+    label = m.group(1)
+    return not label.isupper() and bool(BODY_FIGURE_REF_RE.match(text or ""))
+
+
+def figure_mentions(page, context=3, min_chars=25):
     """Body lines that talk about a figure, with the next line for context.
 
     The interesting sentences are the ones that say what a figure shows and under
@@ -45,20 +67,34 @@ def figure_mentions(page, context=1, min_chars=25):
         text = (ln.get("text") or "").strip()
         if len(text) < min_chars or not FIG_MENTION_RE.search(text):
             continue
-        if CAPTION_RE.match(text) and len(text) < 140:
+        if (CAPTION_RE.match(text) and not is_body_figure_reference(text)
+                and len(text) < 140):
             continue                      # 图注本身已经有清单了，不必重复
         piece = text
-        tail = lines[i + 1:i + 1 + context]
-        if tail:
-            nxt = (tail[0].get("text") or "").strip()
+        # page_text_lines 的输出按视觉行排序；双栏页面中，当前左栏句子后面
+        # 往往先出现同一高度的右栏文字，而不是左栏下一行。只在同一栏寻找
+        # 真正位于下方的续行，避免把另一栏正文拼进 Figure 引用句。
+        found = 0
+        for cand in lines[i + 1:i + 9]:
+            if cand["top"] < ln["bottom"] - 2.0:
+                continue
+            same_column = (abs(cand["x0"] - ln["x0"]) <= 36.0
+                           or _overlap_1d(ln["x0"], ln["x1"],
+                                          cand["x0"], cand["x1"]) >= 40.0)
+            if not same_column:
+                continue
+            nxt = (cand.get("text") or "").strip()
             if nxt and not CAPTION_RE.match(nxt) and nxt[0].islower():
                 piece += " " + nxt        # 句子被换行截断时接上后半句
+                found += 1
+            if found >= context or cand["top"] > ln["bottom"] + 20.0:
+                break
         if piece not in out:
             out.append(piece)
     return out
 
 
-def page_text_lines(page, col_gap=18.0):
+def page_text_lines(page, col_gap=14.0):
     """Group words into lines ourselves, keeping the two columns apart.
 
     pdfplumber's extract_text_lines() merges text that shares a baseline across the
@@ -76,10 +112,28 @@ def page_text_lines(page, col_gap=18.0):
         return []
     rows = []
     for w in sorted(words, key=lambda w: (round(w["top"], 1), w["x0"])):
-        if rows and _same_line(rows[-1], w):
-            rows[-1].append(w)
-        else:
+        # 左右栏的字号和基线并不完全相同。按 top 排序时，一个左栏标题可能
+        # 插到右栏同一行的两个词组之间；只看 rows[-1] 会把真正同行拆开。
+        # 在最近几行里找横向相邻且竖向重叠的候选，仍限制 top 距离以免串段。
+        matched = None
+        best_delta = float("inf")
+        for row in reversed(rows[-6:]):
+            row_top = min(x["top"] for x in row)
+            row_bottom = max(x["bottom"] for x in row)
+            if w["top"] > row_bottom + 2.0:
+                continue
+            if w["bottom"] < row_top - 2.0:
+                continue
+            if _same_line(row, w):
+                new_mid = (w["top"] + w["bottom"]) / 2.0
+                delta = min(abs((old["top"] + old["bottom"]) / 2.0 - new_mid)
+                            for old in row)
+                if delta < best_delta:
+                    matched, best_delta = row, delta
+        if matched is None:
             rows.append([w])
+        else:
+            matched.append(w)
     out = []
     for row in rows:
         row.sort(key=lambda w: w["x0"])
@@ -94,11 +148,27 @@ def page_text_lines(page, col_gap=18.0):
 
 
 def _same_line(row, w):
-    top = min(x["top"] for x in row)
-    bottom = max(x["bottom"] for x in row)
-    overlap = min(bottom, w["bottom"]) - max(top, w["top"])
-    height = min(bottom - top, w["bottom"] - w["top"])
-    return height > 0 and overlap >= 0.5 * height
+    """Match a word to a visual line without letting a tall word bridge rows.
+
+    A tall heading in the left column can overlap two ordinary text rows in the
+    right column. The old aggregate min/max box then fused both right-column rows
+    into one, e.g. ``experimental FIGURE 3 ...``. Compare vertical centres against
+    each existing word rather than using the aggregate row box.
+    """
+    for old in row:
+        height = min(old["bottom"] - old["top"], w["bottom"] - w["top"])
+        old_mid = (old["top"] + old["bottom"]) / 2.0
+        new_mid = (w["top"] + w["bottom"]) / 2.0
+        # 字号不同会让 top/bottom 不齐，但同一印刷行的垂直中心仍接近。
+        # 用单个词的中心比较，避免一个 16pt 标题的高框把上下两个 9pt 行
+        # 同时包含进去，形成跨栏“桥”。
+        if height > 0 and abs(old_mid - new_mid) <= 0.45 * height:
+            return True
+    return False
+
+
+def _overlap_1d(a0, a1, b0, b1):
+    return max(0.0, min(a1, b1) - max(a0, b0))
 
 
 def _line_from(words):
@@ -182,7 +252,7 @@ def analyse_page(page, page_no):
     for i, ln in enumerate(lines):
         text = (ln.get("text") or "").strip()
         m = CAPTION_RE.match(text)
-        if m:
+        if m and not is_body_figure_reference(text):
             full, bbox, n_lines = join_caption_block(lines, i)
             captions.append({
                 "label": m.group(1),

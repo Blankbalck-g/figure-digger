@@ -464,6 +464,30 @@ def mock_response(prompt):
                 keys.append(re.split(r"[（(]", part.strip())[0].strip())
         return json.dumps({"params": {n: {k: "1.5e-2" for k in keys if k}
                                       for n in names}})
+    # 整图 Agent 计划。必须放在通用 "anchors" 分支之前，因为计划本身也含锚点。
+    if "图表提取 agent" in p and "panel_count" in p:
+        return json.dumps({
+            "is_line_chart": True, "chart_type": "line", "panel_count": 1,
+            "panel_layout": {"rows": 1, "cols": 1}, "dual_y_axis": False,
+            "has_legend": True, "reason": "mock executable figure plan",
+            "shared_axis": {
+                "x": {"min": 0, "max": 5, "labels": ["0", "1", "2", "3", "4", "5"],
+                      "scale": "linear", "title": "Time", "unit": "ms", "multiplier": 1},
+                "y_axes": [{"side": "left", "min": 0, "max": 70,
+                            "labels": ["0", "10", "20", "30", "40", "50", "60", "70"],
+                            "scale": "linear", "title": "Penetration", "unit": "mm",
+                            "multiplier": 1}],
+            },
+            "panels": [{
+                "label": "mock panel", "plot_box": [0.08, 0.08, 0.94, 0.86],
+                "axis": None,
+                "exclude_regions": [],
+                "series": [{"label": "Series A", "role": "data", "draw": "line_only",
+                            "line_color": "#ed464e", "marker_color": None,
+                            "marker_shape": "none", "dark": False,
+                            "anchors": [[0.08, 0.95], [0.5, 0.55], [0.92, 0.22]]}],
+            }],
+        })
     # 补缺口：曲线被压住那一段的锚点（裁剪图里的归一化坐标）
     if "锚点" in p and "裁剪图" in p:
         return json.dumps({"anchors": [[0.3, 0.55], [0.5, 0.5], [0.7, 0.45]],
@@ -514,9 +538,28 @@ def mock_response(prompt):
                                "available": "mock: 实际有图 5 贯穿距、图 7 排放"})
         return json.dumps({"selected": [1], "reason": "mock: 第 1 张是你要的（按轴标题判断）",
                            "missing": False, "available": ""})
+    if "plot_box" in p and "独立坐标面板" in prompt:
+        match = re.search(r"含有\s*(\d+)\s*个", prompt)
+        count = int(match.group(1)) if match else 1
+        rows = max(1, int(round(count ** 0.5)))
+        while count % rows:
+            rows -= 1
+        cols = max(1, count // rows)
+        panels = []
+        for r in range(rows):
+            for c in range(cols):
+                panels.append({
+                    "label": f"P{len(panels) + 1}",
+                    "plot_box": [round((c + 0.12) / cols, 4),
+                                 round((r + 0.08) / rows, 4),
+                                 round((c + 0.94) / cols, 4),
+                                 round((r + 0.82) / rows, 4)],
+                })
+        return json.dumps({"rows": rows, "cols": cols, "panels": panels})
     if "classify" in p or "chart type" in p or "哪一类" in p:
         return json.dumps({
             "is_line_chart": True, "chart_type": "line", "panel_count": 1,
+            "panel_layout": {"rows": 1, "cols": 1},
             "dual_y_axis": False, "reason": "mock reply",
         })
     if "axis" in p or "tick" in p or "刻度范围" in p:

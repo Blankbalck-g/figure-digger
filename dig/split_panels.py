@@ -93,6 +93,145 @@ def order_row_major(boxes, row_tol_frac=0.35):
     return ordered
 
 
+def model_plot_boxes(data, image_shape, expected=None):
+    """Validate model-supplied normalised plot rectangles.
+
+    The model only supplies semantic geometry. Pixel tracing still uses these boxes
+    as numeric frames, so malformed, duplicated or strongly overlapping boxes are
+    rejected rather than silently producing plausible-looking wrong coordinates.
+    """
+    h, w = image_shape[:2]
+    rows = data.get("panels") if isinstance(data, dict) else None
+    if not isinstance(rows, list):
+        return []
+    if expected is not None and len(rows) != int(expected):
+        return []
+    out = []
+    for item in rows:
+        raw = item.get("plot_box") if isinstance(item, dict) else item
+        if not isinstance(raw, (list, tuple)) or len(raw) != 4:
+            return []
+        try:
+            vals = [float(v) for v in raw]
+        except (TypeError, ValueError):
+            return []
+        if not all(np.isfinite(v) for v in vals):
+            return []
+        x0, y0, x1, y1 = vals
+        if not (0 <= x0 < x1 <= 1 and 0 <= y0 < y1 <= 1):
+            return []
+        if x1 - x0 < 0.08 or y1 - y0 < 0.08:
+            return []
+        box = (int(round(x0 * w)), int(round(y0 * h)),
+               int(round(x1 * w)), int(round(y1 * h)))
+        box = (max(0, min(w - 2, box[0])), max(0, min(h - 2, box[1])),
+               max(1, min(w - 1, box[2])), max(1, min(h - 1, box[3])))
+        if box[2] - box[0] < 20 or box[3] - box[1] < 20:
+            return []
+        out.append(box)
+
+    # Independent panels may touch at their borders, but their interiors cannot
+    # substantially overlap. A bad box here would mix two coordinate systems.
+    xywh = [(a, b, c - a, d - b) for a, b, c, d in out]
+    for i, a in enumerate(xywh):
+        for b in xywh[i + 1:]:
+            if _inter(a, b) > 0.2 * min(_area(a), _area(b)):
+                return []
+    return out
+
+
+def _longest_bounds(mask):
+    idx = np.flatnonzero(mask)
+    if idx.size == 0:
+        return 0, -1, -1
+    best, start, prev = (1, int(idx[0]), int(idx[0])), int(idx[0]), int(idx[0])
+    for value in idx[1:]:
+        value = int(value)
+        if value == prev + 1:
+            prev = value
+            continue
+        if prev - start + 1 > best[0]:
+            best = (prev - start + 1, start, prev)
+        start = prev = value
+    if prev - start + 1 > best[0]:
+        best = (prev - start + 1, start, prev)
+    return best
+
+
+def refine_plot_box(gray, box, edge_thresh=245, search_frac=0.08):
+    """Snap an approximate model box to nearby long pixel axis/grid lines.
+
+    This is deliberately conservative: each edge may move by only a small fraction
+    of the hinted box. Missing/open axes simply retain the model coordinate.
+    """
+    h, w = gray.shape[:2]
+    x0, y0, x1, y1 = [int(v) for v in box]
+    bw, bh = max(1, x1 - x0), max(1, y1 - y0)
+    sx, sy = max(5, int(search_frac * bw)), max(5, int(search_frac * bh))
+    wx0, wx1 = max(0, x0 - sx), min(w, x1 + sx + 1)
+    wy0, wy1 = max(0, y0 - sy), min(h, y1 + sy + 1)
+
+    def horizontal(target):
+        best = None
+        for yy in range(max(0, target - sy), min(h, target + sy + 1)):
+            length, lo, hi = _longest_bounds(gray[yy, wx0:wx1] < edge_thresh)
+            if length < 0.55 * bw:
+                continue
+            gx0, gx1 = wx0 + lo, wx0 + hi
+            centre_penalty = abs((gx0 + gx1) / 2.0 - (x0 + x1) / 2.0)
+            score = length - 2.0 * abs(yy - target) - centre_penalty
+            if best is None or score > best[0]:
+                best = (score, yy, gx0, gx1)
+        return best
+
+    def vertical(target):
+        best = None
+        for xx in range(max(0, target - sx), min(w, target + sx + 1)):
+            length, lo, hi = _longest_bounds(gray[wy0:wy1, xx] < edge_thresh)
+            if length < 0.55 * bh:
+                continue
+            gy0, gy1 = wy0 + lo, wy0 + hi
+            centre_penalty = abs((gy0 + gy1) / 2.0 - (y0 + y1) / 2.0)
+            score = length - 2.0 * abs(xx - target) - centre_penalty
+            if best is None or score > best[0]:
+                best = (score, xx, gy0, gy1)
+        return best
+
+    top, bottom = horizontal(y0), horizontal(y1)
+    left, right = vertical(x0), vertical(x1)
+    if top:
+        y0 = top[1]
+    if bottom:
+        y1 = bottom[1]
+    if left:
+        x0 = left[1]
+    if right:
+        x1 = right[1]
+
+    # Horizontal borders/grid lines often survive anti-aliasing better than vertical
+    # axes. Their run endpoints are useful x-edge evidence when both agree.
+    hlines = [v for v in (top, bottom) if v]
+    if hlines:
+        hx0 = int(round(np.median([v[2] for v in hlines])))
+        hx1 = int(round(np.median([v[3] for v in hlines])))
+        if abs(hx0 - box[0]) <= 1.5 * sx:
+            x0 = hx0
+        if abs(hx1 - box[2]) <= 1.5 * sx:
+            x1 = hx1
+    vlines = [v for v in (left, right) if v]
+    if vlines:
+        vy0 = int(round(np.median([v[2] for v in vlines])))
+        vy1 = int(round(np.median([v[3] for v in vlines])))
+        if abs(vy0 - box[1]) <= 1.5 * sy:
+            y0 = vy0
+        if abs(vy1 - box[3]) <= 1.5 * sy:
+            y1 = vy1
+
+    if x1 - x0 < 0.7 * bw or y1 - y0 < 0.7 * bh:
+        return tuple(int(v) for v in box)
+    return (int(x0), int(y0), int(x1), int(y1))
+
+
 def _span_overlap(a, b):
     """两条线段在长度方向上的重叠比例（a/b 都是 (idx, start, end, length)）。"""
     inter = max(0, min(a[2], b[2]) - max(a[1], b[1]) + 1)

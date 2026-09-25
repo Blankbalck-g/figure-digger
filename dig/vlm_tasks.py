@@ -11,16 +11,72 @@ example of the expected shape.
 
 CLASSIFY_SYSTEM = "你是科研论文图表的分析助手，只输出 json。"
 
-CLASSIFY_PROMPT = """判断这张论文插图属于哪一类，只输出 json。
-示例 json 输出：
-{"is_line_chart": true, "chart_type": "line", "panel_count": 6, "dual_y_axis": false, "has_legend": true, "reason": "六联折线图"}
+CLASSIFY_PROMPT = """你是图表提取 Agent。先理解整张论文插图，再给像素代码一份可执行计划。
+只输出 json，结构如下：
+{"is_line_chart": true, "chart_type": "line", "panel_count": 2,
+ "panel_layout": {"rows": 1, "cols": 2}, "dual_y_axis": false,
+ "has_legend": true, "reason": "两个独立坐标面板",
+ "shared_axis": {
+   "x": {"min": 0, "max": 1.8, "scale": "linear", "title": "Time",
+         "unit": "ms", "multiplier": 1},
+   "y_axes": [{"side": "left", "min": 0, "max": 90, "scale": "linear",
+               "title": "Penetration", "unit": "mm", "multiplier": 1}]},
+ "panels": [
+   {"label": "150 MPa", "plot_box": [0.07, 0.04, 0.49, 0.45],
+    "axis": null,
+    "exclude_regions": [{"role": "legend", "box": [0.55, 0.08, 0.97, 0.35]}],
+    "series": [
+      {"label": "Exp 150 MPa", "role": "data", "y_axis": "left", "draw": "markers_only",
+       "line_color": null, "marker_color": "#2448ff", "marker_shape": "circle",
+       "dark": false, "anchors": [[0.05, 0.05], [0.30, 0.48], [0.55, 0.92]]},
+      {"label": "Sim 150 MPa", "role": "model", "y_axis": "left", "draw": "line_only",
+       "line_color": "#2448ff", "marker_color": null, "marker_shape": "none",
+       "dark": false, "anchors": [[0.05, 0.04], [0.30, 0.44], [0.55, 0.90]]}
+    ]}
+ ]}
 字段要求：
 - chart_type 只能是 line|scatter|bar|pie|photo|schematic|table|mixed 之一
 - is_line_chart 表示"是否是可以提取数据点的折线图/散点图"
 - panel_count 是子图数量（(a)(b)(c) 这种分开计数）
+- panel_layout 是视觉排列的行列数；单图填 rows=1, cols=1。不要把同一子图里的
+  多条曲线误算成多个 panel
+- panels 必须与 panel_count 一样多，按从上到下、每行从左到右排列
+- plot_box=[x0,y0,x1,y1] 是该面板**数据绘图区**在整张图中的归一化位置；原点在左上，
+  x 向右、y 向下。边界必须对应坐标轴最小/最大位置，不含刻度文字和轴标题
+- 所有面板坐标相同时填写一次 shared_axis，各 panel 的 axis 填 null；只有某面板不同才在
+  panel.axis 覆盖。不要为每格重复相同刻度，避免输出冗长；看不清的字段填 null，不要猜
+- exclude_regions 的 box 使用当前面板绘图区归一化坐标，原点在左下；图例框必须整框排除
+- series 是该面板需要独立输出的数据/模型系列。实验点和模拟线是两条系列，不能因为同色
+  合成一条；同一系列的 marker+连接线才是一条
+- y_axis 填 left 或 right；只有一个纵轴时统一填 left
+- anchors 使用当前绘图区归一化笛卡尔坐标（左下 0,0，右上 1,1），每条曲线给 3~8 个
+  沿走势分布的粗锚点。锚点只指导代码找线，不直接作为数值输出
+- draw 只能是 markers_only|markers_connected|line_only；role 只能是 data|model
+- line_color/marker_color 用实际十六进制颜色；黑色或深灰线必须 dark=true
 - dual_y_axis 表示是否有左右两条 Y 轴
 - reason 用一句话说明判断依据
 注意：实验装置照片、示意图、表格都不是折线图（is_line_chart=false）。"""
+
+PANEL_SYSTEM = "你是科研论文多面板图的版面定位助手，只输出 json。"
+
+PANEL_PROMPT = """上一轮图表计划没有给出有效面板框。这张论文插图已经确认含有
+{expected} 个独立坐标面板。请重新逐个定位每个面板的**数据绘图区矩形**，只输出 json：
+{{"rows": 3, "cols": 2,
+  "panels": [
+    {{"label": "150 MPa", "plot_box": [0.08, 0.02, 0.51, 0.29]}},
+    {{"label": "120 MPa", "plot_box": [0.56, 0.02, 0.97, 0.29]}}
+  ]}}
+
+严格要求：
+- panels 必须正好有 {expected} 项，按从上到下、每行从左到右排列
+- plot_box=[x0,y0,x1,y1]，坐标相对**整张输入图**归一化到 0~1；原点在左上，
+  x 向右、y 向下
+- plot_box 是坐标轴包围的数据区域：左/右边界对应 x 轴最小/最大位置，
+  上/下边界对应 y 轴最大/最小位置
+- 不要把刻度数字、轴标题、图例文字或相邻子图包含进 plot_box
+- label 优先填写该面板图例/标题里的工况（如 150 MPa）；没有就填 (a)/(b) 或 null
+- 多条曲线、散点和拟合线属于同一个坐标框，不能因此重复报面板
+"""
 
 AXIS_SYSTEM = "你是科研论文图表的读数助手，只输出 json。"
 
@@ -146,7 +202,20 @@ BODY_SELECT_PROMPT = """用户要从这篇论文里找出他需要的数据图�
 
 
 def classify_chart(vlm, image_path):
-    data, raw = vlm.ask_json(image_path, CLASSIFY_PROMPT, system=CLASSIFY_SYSTEM)
+    # A multi-panel executable plan is larger than the old one-line classifier.
+    # Give it enough room and retry transient/empty replies; truncated JSON must not
+    # reach the pipeline as a half-valid plan.
+    data, raw = vlm.ask_json(image_path, CLASSIFY_PROMPT, system=CLASSIFY_SYSTEM,
+                             max_tokens=4096, retries=2)
+    data["_raw"] = raw
+    return data
+
+
+def locate_panels(vlm, image_path, expected):
+    """Ask for plot rectangles only when pixel geometry disagrees with panel count."""
+    data, raw = vlm.ask_json(
+        image_path, PANEL_PROMPT.format(expected=int(expected)),
+        system=PANEL_SYSTEM, retries=2)
     data["_raw"] = raw
     return data
 

@@ -158,7 +158,8 @@ def detect_legend_colors(figure_img):
     return colors
 
 
-def split_figure(figure_path, outdir, margin=None):
+def split_figure(figure_path, outdir, margin=None, expected_panels=None,
+                 panel_geometry=None, split_meta=None):
     """Return [(panel_image_path, frame_in_panel_coords, box_in_figure)] for a figure."""
     img = iio.imread(figure_path)
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
@@ -167,6 +168,50 @@ def split_figure(figure_path, outdir, margin=None):
     # 单靠轮廓法会退回"曲线围出的空洞"，把整幅子图的数据丢掉。
     boxes = sp.order_row_major(sp.merge_panel_boxes(sp.find_panel_boxes(gray),
                                                     sp.find_spine_boxes(gray)))
+    expected = None
+    try:
+        expected = int(expected_panels) if expected_panels is not None else None
+    except (TypeError, ValueError):
+        expected = None
+    if expected is not None and expected < 1:
+        expected = None
+    meta = split_meta if isinstance(split_meta, dict) else {}
+    meta.update({"expected": expected, "pixel_detected": len(boxes)})
+
+    # The Agent supplies the semantic decomposition first; code validates the count,
+    # rejects overlaps, and snaps its approximate boxes to real pixel lines. This is
+    # an executable plan, not advisory metadata.
+    hinted = sp.model_plot_boxes(panel_geometry or {}, gray.shape, expected=expected)
+    if hinted:
+        refined = [sp.refine_plot_box(gray, b) for b in hinted]
+        meta.update({"source": "agent-plan+pixel-refine", "used": len(refined),
+                     "plot_boxes": [list(b) for b in refined],
+                     "panel_labels": [str(p.get("label") or "")
+                                      for p in (panel_geometry.get("panels") or [])]})
+        outdir = Path(outdir)
+        outdir.mkdir(parents=True, exist_ok=True)
+        panels = []
+        for i, (x0, y0, x1, y1) in enumerate(refined):
+            bw, bh = x1 - x0, y1 - y0
+            # Keep tick labels and axis titles in the crop while ensuring the
+            # numerical frame remains exactly the Agent+pixel plotting rectangle.
+            cx0 = max(0, x0 - int(0.15 * bw))
+            cx1 = min(w, x1 + int(0.05 * bw))
+            cy0 = max(0, y0 - int(0.06 * bh))
+            cy1 = min(h, y1 + int(0.16 * bh))
+            crop = img[cy0:cy1, cx0:cx1]
+            name = f"{Path(figure_path).stem}_p{i + 1:02d}.png"
+            path = outdir / name
+            iio.imwrite(path, crop)
+            panels.append((path, (x0 - cx0, y0 - cy0, x1 - cx0, y1 - cy0),
+                           (cx0, cy0, cx1 - cx0, cy1 - cy0)))
+        return panels
+
+    # If their counts disagree, never silently flatten a known multi-panel figure.
+    if expected and expected > 1 and len(boxes) != expected:
+        meta.update({"source": "count-mismatch", "used": 0})
+        return []
+
     if not boxes:
         # 一个绘图框都没检出：整图当一个面板处理。丢弃才是更糟的选择——
         # 位图路线后面还有"非数据图"门限会把它拦下，静默丢图则连机会都没有。
@@ -175,10 +220,12 @@ def split_figure(figure_path, outdir, margin=None):
         except Exception:  # noqa: BLE001
             frame = (0, 0, w, h)
         log(f"      （未检出子图框，按单面板处理 frame={tuple(frame)}）", detail=True)
+        meta.update({"source": "single-fallback", "used": 1})
         return [(Path(figure_path), tuple(frame), (0, 0, w, h))]
 
     if len(boxes) == 1:
         x, y, bw, bh = boxes[0]
+        meta.update({"source": "pixel", "used": 1})
         return [(Path(figure_path), (x, y, x + bw, y + bh), (x, y, bw, bh))]
 
     if margin is None:
@@ -196,6 +243,7 @@ def split_figure(figure_path, outdir, margin=None):
         path = outdir / name
         iio.imwrite(path, crop)
         panels.append((path, (x - x0, y - y0, x + bw - x0, y + bh - y0), (x, y, bw, bh)))
+    meta.update({"source": "pixel", "used": len(panels)})
     return panels
 
 
@@ -776,6 +824,33 @@ def _apply_review(review, entries, failed, aliases):
         except (TypeError, ValueError, IndexError):
             continue
         if 1 <= a <= n and 1 <= b <= n and a != b:
+            sa = entries[a - 1]["p"]["s"]
+            sb = entries[b - 1]["p"]["s"]
+            role_a = str(sa.get("role") or "data").strip().lower()
+            role_b = str(sb.get("role") or "data").strip().lower()
+            draw_a = str(sa.get("draw") or "").strip().lower()
+            draw_b = str(sb.get("draw") or "").strip().lower()
+            label_a = str(sa.get("label") or "").strip().lower()
+            label_b = str(sb.get("label") or "").strip().lower()
+            # The full-figure planner sees captions, panel identity and legends. The
+            # local critic sees only an overlay and frequently calls near-coincident
+            # experimental markers + simulation line "duplicates". It may merge two
+            # geometric traces only when their semantic contracts are compatible.
+            semantically_distinct = (
+                {role_a, role_b} == {"data", "model"}
+                or {draw_a, draw_b} == {"markers_only", "line_only"}
+                or (label_a and label_b and label_a != label_b
+                    and ("exp" in label_a or "exp" in label_b)
+                    and ("sim" in label_a or "sim" in label_b)))
+            if semantically_distinct:
+                aliases.append({
+                    "label": sa.get("label") or f"series{a}",
+                    "alias_of": None, "overlap": None,
+                    "by": "语义计划保护",
+                    "why": (f"忽略局部复盘 merge={pair}：{role_a}/{draw_a} 与 "
+                            f"{role_b}/{draw_b} 是计划中不同物理系列"),
+                })
+                continue
             merged_into[max(a, b)] = min(a, b)
     out = []
     for idx, e in enumerate(entries, start=1):
@@ -1759,11 +1834,49 @@ def analyze(pdf_path, outdir, dpi=300, vlm=None, pages=None, use_ocr=None, want=
         if fig.get("frame"):
             # 矢量回退：坐标框已知，不必（也不该）再去图里猜子图
             panels = [(fig_path, tuple(fig["frame"]), (0, 0, fig_img.shape[1], fig_img.shape[0]))]
+            split_info = {"source": "vector-known-frame", "expected": 1,
+                          "pixel_detected": 1, "used": 1}
         else:
-            panels = split_figure(fig_path, outdir / "panels")
+            expected_panels = (vlm_cls or {}).get("panel_count")
+            split_info = {}
+            panels = split_figure(fig_path, outdir / "panels",
+                                  expected_panels=expected_panels,
+                                  panel_geometry=vlm_cls,
+                                  split_meta=split_info)
+            expected_n = split_info.get("expected")
+            if expected_n and expected_n > 1 and len(panels) != expected_n and vlm is not None:
+                log(f"      像素面板检测={split_info.get('pixel_detected', 0)}，"
+                    f"但模型识别={expected_n}；调用版面定位工具，不再整图降级",
+                    detail=True)
+                try:
+                    geometry = vt.locate_panels(vlm, fig_path, expected_n)
+                    panels = split_figure(fig_path, outdir / "panels",
+                                          expected_panels=expected_n,
+                                          panel_geometry=geometry,
+                                          split_meta=split_info)
+                    if panels:
+                        log(f"      模型定位 + 像素校准：得到 {len(panels)} 个独立面板",
+                            detail=True)
+                except vlmc.VLMError as exc:
+                    log(f"      面板定位失败: {exc}")
+                except Exception as exc:  # noqa: BLE001
+                    log(f"      面板定位异常: {type(exc).__name__}: {exc}")
+            if expected_n and expected_n > 1 and len(panels) != expected_n:
+                log(f"      ⏭ 跳过该图：已确认有 {expected_n} 个面板，但只能可靠定位"
+                    f" {len(panels)} 个；禁止把整图当一个坐标系生成错误数据")
+                continue
         for idx, (panel_path, frame, box) in enumerate(panels, start=1):
             pid = f"{fig_path.stem}_p{idx}"
             log(f"  面板 {idx}/{len(panels)}: {panel_path.name} frame={frame}", detail=True)
+            panel_img = iio.imread(panel_path)
+            if panel_img is None:
+                log(f"      ⏭ 面板图读取失败：{panel_path}")
+                continue
+            panel_legend_colors = (detect_legend_colors(panel_img)
+                                   or legend_colors)
+            plan_rows = (vlm_cls or {}).get("panels") or []
+            panel_plan = plan_rows[idx - 1] if idx <= len(plan_rows) \
+                and isinstance(plan_rows[idx - 1], dict) else {}
             entry = {
                 "id": pid,
                 "page": page,
@@ -1772,35 +1885,56 @@ def analyze(pdf_path, outdir, dpi=300, vlm=None, pages=None, use_ocr=None, want=
                 "frame": list(frame),
                 "box_in_figure": list(box),
                 "caption": caption,
-                "legend_colors": legend_colors,
+                "legend_colors": panel_legend_colors,
                 "series_names": name_map,
                 "series_roles": series_roles,
                 "vlm_dark_line": dark_info,
                 "vlm_classification": vlm_cls,
+                "panel_split": {k: v for k, v in split_info.items()
+                                if k != "panel_labels"},
                 "axis": {"x": None, "y": None, "confirmed": False},
             }
+            if panel_plan:
+                entry["agent_plan"] = {
+                    "label": panel_plan.get("label"),
+                    "plot_box": panel_plan.get("plot_box"),
+                    "axis_planned": bool(panel_plan.get("axis")),
+                    "series_planned": len(panel_plan.get("series") or []),
+                    "exclude_regions": panel_plan.get("exclude_regions") or [],
+                }
+            labels = split_info.get("panel_labels") or []
+            if idx <= len(labels) and labels[idx - 1]:
+                entry["panel_label"] = labels[idx - 1]
             # ---- 轴读数：VLM 先读（主），OCR 随后独立核对（辅）----
-            va = None
-            if vlm is not None:
+            planned_axis = panel_plan.get("axis") if isinstance(panel_plan, dict) else None
+            if not planned_axis and isinstance(vlm_cls, dict):
+                planned_axis = vlm_cls.get("shared_axis")
+            va = planned_axis if isinstance(planned_axis, dict) \
+                and planned_axis.get("x") and (planned_axis.get("y_axes")
+                                                or planned_axis.get("y")) else None
+            if va is not None:
+                log("      使用整图 Agent 计划中的逐面板轴定义", detail=True)
+            elif vlm is not None:
                 try:
                     va = vt.read_axis_ranges(vlm, panel_path, hint=_axis_hint(want))
-                    y_axes = _norm_y_axes(va)
-                    entry["vlm_axis"] = {"x": va.get("x"), "y_axes": va.get("y_axes"),
-                                         "y": va.get("y"),
-                                         "confidence": va.get("confidence"),
-                                         "note": va.get("note")}
-                    if y_axes:
-                        entry["y_axes"] = y_axes
-                    _record_axis_check(entry, va, want, log)
-                    log("      VLM 轴读数: x=" + str(_norm_axis(va.get("x")))
-                        + "  y=" + (", ".join(
-                            f"{k}轴{[round(d['range'][0], 4), round(d['range'][1], 4)]}"
-                            for k, d in y_axes.items()) or "None")
-                        + f"  置信度={va.get('confidence')}", detail=True)
                 except vlmc.VLMError as exc:
                     log(f"      VLM 轴读数失败: {exc}（回退 OCR）")
                 except Exception as exc:  # noqa: BLE001
                     log(f"      VLM 轴读数异常: {type(exc).__name__}: {exc}")
+            if va is not None:
+                y_axes = _norm_y_axes(va)
+                entry["vlm_axis"] = {"x": va.get("x"), "y_axes": va.get("y_axes"),
+                                     "y": va.get("y"),
+                                     "confidence": va.get("confidence"),
+                                     "note": va.get("note")}
+                if y_axes:
+                    entry["y_axes"] = y_axes
+                _record_axis_check(entry, va, want, log)
+                log("      VLM 轴读数: x=" + str(_norm_axis(va.get("x")))
+                    + "  y=" + (", ".join(
+                        f"{k}轴{[round(d['range'][0], 4), round(d['range'][1], 4)]}"
+                        for k, d in y_axes.items()) or "None")
+                    + f"  置信度={va.get('confidence')}", detail=True)
 
             ocr_ranges = {}
             if use_ocr:
@@ -1866,11 +2000,22 @@ def analyze(pdf_path, outdir, dpi=300, vlm=None, pages=None, use_ocr=None, want=
             # 关键在于模型输出的是"要提取什么"（正向清单），不再是"我给的候选里哪个不是"
             # ——后者必然出现"数据被 skip 掉、该 skip 的却留下"。
             if vlm is not None and find_series:
+                planned_series = panel_plan.get("series") if isinstance(panel_plan, dict) else None
                 try:
-                    legend_text = "、".join(
-                        f"{v}（{k}）" for k, v in (name_map or {}).items()
-                    ) or "、".join(legend_colors)
-                    found = vt.find_series(vlm, panel_path, legend_text)
+                    if planned_series:
+                        found = {
+                            "chart_family": vlm_cls.get("chart_type") or "line",
+                            "series_count": len(planned_series),
+                            "series": planned_series,
+                            "exclude_regions": panel_plan.get("exclude_regions") or [],
+                            "ignore": panel_plan.get("ignore") or [],
+                        }
+                        log("      使用整图 Agent 计划中的逐面板系列清单", detail=True)
+                    else:
+                        legend_text = "、".join(
+                            f"{v}（{k}）" for k, v in (name_map or {}).items()
+                        ) or "、".join(panel_legend_colors)
+                        found = vt.find_series(vlm, panel_path, legend_text)
                     spec, ignored = _planner_series(found)
                     if spec:
                         entry["series_spec"] = spec
@@ -1899,7 +2044,7 @@ def analyze(pdf_path, outdir, dpi=300, vlm=None, pages=None, use_ocr=None, want=
             # Not-a-line-chart filter: needs both no readable ticks AND no curve-like
             # pixel content. Photos/schematics fail on both counts; a line chart only
             # has to pass one of them.
-            coverage, thickness = curve_content(fig_img, frame, legend_colors)
+            coverage, thickness = curve_content(panel_img, frame, panel_legend_colors)
             entry["curve_content"] = {"coverage": round(coverage, 3),
                                       "median_thickness": round(thickness, 2)}
             curve_ok = coverage >= 0.75 and thickness >= 2
@@ -1989,6 +2134,13 @@ def write_report(config, path, phase, results=None):
                + "、".join(f"{k}×{float(v):g}" for k, v in (ax.get("multiplier") or {}).items())
                + "（CSV 里的数值已按此换算）" if ax.get("multiplier") else ""),
         ]
+        if p.get("panel_label"):
+            lines.append(f"- 面板语义: {p['panel_label']}")
+        split = p.get("panel_split") or {}
+        if split:
+            lines.append(f"- 面板定位: {split.get('source') or '?'}"
+                         f"（模型预期 {split.get('expected') or '?'}，"
+                         f"像素初检 {split.get('pixel_detected', '?')}）")
         if ax.get("x_title") or ax.get("y_title"):
             chk = p.get("axis_check") or {}
             verdict = ("✅ 符合" if chk.get("matches") is True else

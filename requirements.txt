@@ -10,6 +10,7 @@ pdfminer.six>=20221105    # pdfplumber 的解析后端（取文字、路径、�
 numpy>=1.24               # 数组与像素运算                                          验证: 2.4.x
 opencv-python>=4.10       # 图像处理：轴框检测、颜色匹配、质检图渲染                 验证: 4.11.0.86
 pillow>=10                # 图片读取/缩放与 token 尺寸估算（pdfplumber 也会带上，但直接用到需显式声明）
+streamlit>=1.40           # DIG Studio 浏览器图形界面（streamlit run app.py）
 
 # —— 可选：刻度 OCR ——
 # 不装也能跑：轴范围可改由 VLM 读取（--vlm），或人工填写后 extract。

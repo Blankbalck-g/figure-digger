@@ -24,3 +24,6 @@ __pycache__/
 # 临时文件
 *.log
 *.err
+
+# DIG Studio 上传文件与运行产物
+.ui_workspace/

@@ -12,6 +12,18 @@
 
 ## 🚀 快速开始
 
+### 图形界面（推荐）
+
+```bash
+pip install -r requirements.txt
+streamlit run app.py
+```
+
+浏览器中的 **DIG Studio** 支持拖拽上传单篇或多篇 PDF、自然语言选图、VLM/OCR 参数配置、
+实时日志、CSV 预览、质检图画廊和一键打包下载。API Key 仅传给当前运行进程，不会写入磁盘。
+
+### 命令行
+
 ```bash
 # 0) 依赖（详情见 requirements.txt）
 pip install -r requirements.txt
